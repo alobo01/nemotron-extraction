@@ -1,8 +1,8 @@
 name: Publish to PyPI
 
 on:
-  release:
-    types: [published]
+  push:
+    tags: ["v*"]
 
 permissions:
   contents: read
@@ -25,7 +25,7 @@ jobs:
           python-version: "3.12"
       - name: Verify release version
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           uv run --no-project python - <<'PY'
           import os
@@ -64,3 +64,34 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - name: Publish with Trusted Publishing
         run: uv publish --trusted-publishing always
+
+  release:
+    name: Create GitHub release
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-distributions
+          path: dist/
+      - name: Publish release and attach distributions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cat > release-notes.md <<'EOF'
+          Activation hooks for the official Nemotron 3 Nano BF16 checkpoint.
+
+          - Hugging Face Transformers and asynchronous vLLM extraction with six hook types.
+          - Single-file benchmark for English, German and Spanish.
+          - Validation report, contribution instructions and BibTeX citation.
+
+          All 40 local tests pass. Cross-backend agreement passed at 3 of 18 sites
+          per language in the documented sample; see the report for measurements.
+          EOF
+          gh release create "$RELEASE_TAG" dist/* --verify-tag \
+            --title "Nemotron Extraction $RELEASE_TAG" --notes-file release-notes.md
