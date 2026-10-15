@@ -2,7 +2,9 @@ name: Publish to PyPI
 
 on:
   push:
+    branches: [master]
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -32,6 +34,9 @@ jobs:
           import tomllib
           from pathlib import Path
 
+          if not os.environ["GITHUB_REF"].startswith("refs/tags/"):
+              print("Branch validation run; release tag check is not applicable.")
+              raise SystemExit(0)
           version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
           if os.environ["RELEASE_TAG"] != f"v{version}":
               raise SystemExit(f"Release tag must be v{version}")
@@ -48,6 +53,7 @@ jobs:
 
   publish:
     name: Publish distributions
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -67,6 +73,7 @@ jobs:
 
   release:
     name: Create GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: publish
     runs-on: ubuntu-latest
     timeout-minutes: 5
