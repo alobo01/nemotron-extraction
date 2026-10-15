@@ -1,0 +1,235 @@
+import importlib
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+from safetensors.torch import save_file
+
+from nemotron_extraction import ActivationBatch, HFExtractor, HookSite, VLLMExtractor
+from nemotron_extraction.hf import _cuda_device_index
+from nemotron_extraction.hooks import install, representative_sites
+from nemotron_extraction.worker import assemble_rows
+
+
+class TinyMamba(nn.Module):
+    def forward(self, hidden_states):
+        return hidden_states * 2
+
+
+class TinyMoE(nn.Module):
+    def forward(self, hidden_states):
+        return hidden_states + 3
+
+
+class TinyAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.o_proj = nn.Linear(4, 2, bias=False)
+        with torch.no_grad():
+            self.o_proj.weight.copy_(torch.tensor([[1., 0., 0., 0.], [0., 1., 0., 0.]]))
+
+    def forward(self, hidden_states):
+        return self.o_proj(torch.cat([hidden_states, hidden_states + 5], -1))
+
+
+class Block(nn.Module):
+    def __init__(self, mixer):
+        super().__init__()
+        self.mixer = mixer
+
+    def forward(self, hidden_states):
+        return hidden_states + self.mixer(hidden_states)
+
+
+class Decoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([Block(TinyMamba()), Block(TinyMoE()), Block(TinyAttention())])
+        self.fail = False
+
+    def forward(self, input_ids, use_cache=False):
+        hidden = torch.stack([input_ids.float(), input_ids.float() + 1], -1)
+        for layer in self.layers:
+            hidden = layer(hidden)
+        if self.fail:
+            raise RuntimeError("forward failure")
+        return hidden
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = Decoder()
+
+
+def test_unindexed_cuda_device_resolves_for_set_device(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    assert _cuda_device_index(torch.device("cuda")) == 3
+    assert _cuda_device_index(torch.device("cuda:1")) == 1
+
+
+def test_all_semantics_and_projection_widths():
+    model = Model()
+    sites = [HookSite(0, "resid_pre"), HookSite(0, "resid_post"), HookSite(0, "mamba_out"),
+             HookSite(1, "moe_out"), HookSite(2, "attn_out"), HookSite(2, "attn_out_prelinear")]
+    tokens = torch.tensor([[2, 3], [5, 7]])
+    hidden = torch.stack([tokens.float(), tokens.float() + 1], -1).reshape(-1, 2)
+    with HFExtractor(model, sites, device="cpu") as extractor:
+        result = extractor.extract(tokens)
+        assert torch.equal(result.token_ids, tokens)
+        assert torch.equal(result.activations["L0_resid_pre"], hidden)
+        assert torch.equal(result.activations["L0_mamba_out"], hidden * 2)
+        assert torch.equal(result.activations["L0_resid_post"], hidden * 3)
+        assert torch.equal(result.activations["L1_moe_out"], hidden * 3 + 3)
+        assert torch.equal(result.activations["L2_attn_out"], hidden * 6 + 3)
+        assert result.activations["L2_attn_out_prelinear"].shape == (4, 4)
+        assert extractor.topology["L2_attn_out_prelinear"]["module_path"] == "model.layers.2.mixer.o_proj"
+        # CPU outputs own their storage across subsequent extraction calls.
+        extractor.extract(tokens + 10)
+        assert torch.equal(result.activations["L0_resid_pre"], hidden)
+        assert model.training
+    assert not model.model.layers[0]._forward_pre_hooks
+    extractor.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        extractor.extract(tokens)
+
+
+def test_forward_failure_cleans_captures_and_restores_mode():
+    model = Model()
+    with HFExtractor(model, [HookSite(0, "resid_post")], device="cpu") as extractor:
+        model.model.fail = True
+        with pytest.raises(RuntimeError, match="forward failure"):
+            extractor.extract(torch.tensor([[1, 2]]))
+        assert extractor.captured == {}
+        assert model.training
+        model.model.fail = False
+        assert extractor.extract(torch.tensor([[1]])).activations["L0_resid_post"].shape == (1, 2)
+    assert not model.model.layers[0]._forward_hooks
+
+
+def test_invalid_topology_installation_rolls_back():
+    model = Model()
+    with pytest.raises(ValueError, match="compatible"):
+        HFExtractor(model, [HookSite(0, "resid_post"), HookSite(0, "attn_out")], device="cpu")
+    assert not model.model.layers[0]._forward_hooks
+    assert len(representative_sites(model)) == 10
+
+
+class SplitBlock(nn.Module):
+    def forward(self, positions, hidden_states, residual):
+        return hidden_states * 2, hidden_states + residual
+
+
+def test_vllm_split_residual_and_input_mutation():
+    model = nn.Module()
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([SplitBlock()])
+    captured = {}
+    handles, _ = install(model, [HookSite(0, "resid_pre"), HookSite(0, "resid_post")], captured, worker=True)
+    hidden, running = torch.tensor([[1., 2.]]), torch.tensor([[4., 5.]])
+    model.model.layers[0](None, hidden, running)
+    hidden.zero_()
+    running.zero_()
+    assert torch.equal(captured["L0_resid_pre"], torch.tensor([[5., 7.]]))
+    assert torch.equal(captured["L0_resid_post"], torch.tensor([[7., 11.]]))
+    for handle in handles:
+        handle.remove()
+
+
+def test_packed_rows_reordering_duplicates_and_decode_exclusion():
+    tokens = torch.tensor([[1, 2], [3, 4], [1, 2]])
+    steps = [{"input_ids": torch.tensor([3, 4, 1, 2]), "positions": torch.tensor([0, 1, 0, 1]),
+              "site": torch.tensor([[30.], [40.], [10.], [20.]])},
+             {"input_ids": torch.tensor([1, 2, 99]), "positions": torch.tensor([0, 1, 2]),
+              "site": torch.tensor([[11.], [21.], [99.]])}]
+    # A decode row is in a separate engine step; it must never enter prompt output.
+    steps[1] = {key: value[:2] for key, value in steps[1].items()}
+    steps.append({"input_ids": torch.tensor([99]), "positions": torch.tensor([2]), "site": torch.tensor([[99.]])})
+    result = assemble_rows(steps, tokens, ["site"])["site"]
+    assert result.flatten().tolist() == [10., 20., 30., 40., 11., 21.]
+    with pytest.raises(RuntimeError, match="Missing"):
+        assemble_rows(steps[:1], tokens, ["site"])
+
+
+@pytest.mark.parametrize("site", [(-1, "resid_post"), (True, "resid_post"), (0, "expert")])
+def test_invalid_sites(site):
+    with pytest.raises(ValueError):
+        HookSite(*site)
+
+
+def test_rejects_padding_like_shapes_and_nonfinite():
+    with HFExtractor(Model(), [HookSite(0, "resid_post")], device="cpu") as extractor:
+        for tokens in (torch.ones(2, 3), torch.ones(2, dtype=torch.long), torch.empty(0, 2, dtype=torch.long)):
+            with pytest.raises(ValueError, match="rectangular"):
+                extractor.extract(tokens)
+    with pytest.raises(ValueError, match="nonfinite"):
+        ActivationBatch(torch.tensor([[1]]), {"x": torch.tensor([[float("nan")]])})
+
+
+def test_vllm_driver_transport_cleanup_and_installed_worker(monkeypatch, tmp_path):
+    instances = []
+
+    class Engine:
+        def __init__(self, args):
+            self.kwargs = kwargs = vars(args)
+            module, name = kwargs["worker_extension_cls"].rsplit(".", 1)
+            assert getattr(importlib.import_module(module), name)
+            self.llm_engine = SimpleNamespace(model_executor=SimpleNamespace(shutdown=self.shutdown))
+            self.stopped = False
+            instances.append(self)
+
+        @classmethod
+        def from_engine_args(cls, args):
+            return cls(args)
+
+        async def generate(self, prompt, params, request_id):
+            yield None
+
+        async def abort(self, request_id):
+            pass
+
+        async def collective_rpc(self, method, args=()):
+            if method == "nh_install":
+                self.sink = args[1]
+                return [{"L0_resid_post": {"module_path": "model.layers.0"}}]
+            if method == "nh_begin":
+                self.wave, _, tokens, self.path = args
+                self.tokens = torch.tensor(tokens)
+                return [True]
+            if method == "nh_seal":
+                save_file({"token_ids": self.tokens, "L0_resid_post": self.tokens.reshape(-1, 1).float()}, self.path)
+                self.ready = getattr(self, "ready", []) + [{"path": self.path, "wave_id": self.wave, "topology": {},
+                               "peak_gpu_memory_bytes": 123, "peak_gpu_reserved_bytes": 123,
+                               "peak_device_memory_bytes": 123, "actual_forward_batches": [len(self.tokens)],
+                               "worker_copy_seconds": 0.0, "write_seconds": 0.0, "worker_forward_seconds": 0.0}]
+                return [True]
+            if method == "nh_poll":
+                ready = getattr(self, "ready", [])
+                self.ready = []
+                return [ready]
+            return [None]
+
+        def shutdown(self):
+            self.stopped = True
+
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(AsyncEngineArgs=lambda **k: SimpleNamespace(**k), SamplingParams=lambda **k: k))
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.async_llm", SimpleNamespace(AsyncLLM=Engine))
+    with VLLMExtractor("fixture", [HookSite(0, "resid_post")], sink_dir=tmp_path, sequences_per_call=2) as extractor:
+        tokens = torch.tensor([[1, 2], [3, 4], [1, 2]])
+        result = extractor.extract(tokens)
+        assert result.activations["L0_resid_post"].flatten().tolist() == tokens.flatten().tolist()
+        assert extractor.peak_gpu_memory_bytes == 123
+    assert instances[0].stopped
+    assert not list(tmp_path.iterdir())
+    assert instances[0].kwargs["enable_prefix_caching"] is False
+    assert instances[0].kwargs["enforce_eager"] is True
+
+
+@pytest.mark.parametrize("kwargs", [{"enforce_eager": False}, {"tensor_parallel_size": 2},
+                                    {"enable_prefix_caching": True}, {"enable_chunked_prefill": True}])
+def test_unsupported_vllm_options_rejected_before_import(kwargs):
+    with pytest.raises(ValueError, match="Requires"):
+        VLLMExtractor("fixture", [HookSite(0, "resid_post")], **kwargs)

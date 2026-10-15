@@ -1,0 +1,5 @@
+The worker hooks, residual reconstruction, attention projection resolution,
+and token-row assembly are adapted from the MIT-licensed nemotron-sae
+sae_pipeline extraction and hook implementation (2026 contributors).
+This package uses vLLM's worker-extension API directly; it does not vendor
+or require IBM vLLM-Hook. Model weights and datasets retain their own licenses.

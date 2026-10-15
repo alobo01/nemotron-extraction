@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nemotron-extraction"
+version = "1.0.0"
+authors = [{name = "Antonio Lobo-Santos"}]
+description = "Small, token-aligned activation hooks for Nemotron in PyTorch and vLLM"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["torch>=2.7", "safetensors>=0.4.5"]
+
+[project.optional-dependencies]
+hf = ["transformers>=4.57.3,<6", "accelerate>=1.0"]
+vllm = ["vllm>=0.20.1,<0.30; sys_platform == 'linux'"]
+benchmark = ["datasets>=3,<6", "huggingface-hub>=0.25,<2"]
+
+[dependency-groups]
+dev = ["pytest>=8", "build>=1.2"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["cuda: requires a real CUDA model and inference engines"]

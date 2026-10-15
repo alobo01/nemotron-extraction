@@ -1,0 +1,6 @@
+include LICENSE NOTICE CITATION.bib
+include uv.lock
+include report.tex report.pdf
+recursive-include benchmarks *.py
+prune outputs
+prune internal_docs
