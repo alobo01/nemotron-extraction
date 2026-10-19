@@ -60,6 +60,8 @@ class HFExtractor:
         self.driver_read_seconds = 0.0
         self.actual_forward_batches = []
         self.peak_gpu_memory_bytes = self.peak_gpu_reserved_bytes = self.peak_device_memory_bytes = 0
+        self.total_device_memory_bytes = 0
+        self.peak_device_memory_fraction = 0.0
         started = time.perf_counter()
         try:
             self.handles, self.topology = install(model, self.sites, self.captured)
@@ -131,9 +133,9 @@ class HFExtractor:
                 self.peak_gpu_memory_bytes = max(self.peak_gpu_memory_bytes, torch.cuda.max_memory_allocated(self.device))
                 self.peak_gpu_reserved_bytes = max(self.peak_gpu_reserved_bytes, torch.cuda.max_memory_reserved(self.device))
                 self.peak_device_memory_bytes = max(self.peak_device_memory_bytes, total - free)
-                if total - free > total * self.gpu_memory_utilization:
-                    copied.result()
-                    raise RuntimeError("GPU memory budget exceeded (96% target)")
+                self.total_device_memory_bytes = max(self.total_device_memory_bytes, total)
+                self.peak_device_memory_fraction = max(
+                    self.peak_device_memory_fraction, (total - free) / total if total else 0.0)
             else:
                 for key, source in sources.items():
                     values[key].copy_(source.reshape(values[key].shape))

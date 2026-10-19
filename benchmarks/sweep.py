@@ -231,7 +231,9 @@ async def language(extractor, args, manifest, language, comparison_pool):
               "memory_limit_fraction": .96, "kv_cache_memory_bytes": getattr(extractor, "kv_cache_memory_bytes", None),
               "peak_gpu_memory_bytes": extractor.peak_gpu_memory_bytes,
               "peak_gpu_reserved_bytes": extractor.peak_gpu_reserved_bytes,
-              "peak_device_memory_bytes": extractor.peak_device_memory_bytes}
+              "peak_device_memory_bytes": extractor.peak_device_memory_bytes,
+              "total_device_memory_bytes": extractor.total_device_memory_bytes,
+              "peak_device_memory_fraction": extractor.peak_device_memory_fraction}
     forwards = [item for item in timeline if item["name"] == "forward"]
     record["overlap_seconds"] = {name: sum(max(0., min(a["end"], b["end"]) - max(a["start"], b["start"]))
                                              for a in forwards for b in timeline

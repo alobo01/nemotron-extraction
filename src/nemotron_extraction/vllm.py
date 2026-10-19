@@ -22,21 +22,25 @@ class VLLMExtractor:
                  enable_chunked_prefill=False, sink_dir=None, gpu_memory_utilization=0.96,
                  kv_cache_memory_bytes=None):
         self.sites = validate_sites(sites)
-        if tensor_parallel_size != 1 or not enforce_eager or enable_prefix_caching or enable_chunked_prefill:
-            raise ValueError("Requires TP=1, eager=True, prefix caching=False and chunked prefill=False")
+        if tensor_parallel_size != 1 or not enforce_eager or enable_prefix_caching:
+            raise ValueError("Requires TP=1, eager=True and prefix caching=False")
         if sequences_per_call < 1 or max_model_len < 2 or not 0 < gpu_memory_utilization <= 1:
             raise ValueError("Invalid sequence batch size, model length or memory utilization")
         self.sequences_per_call, self.max_model_len = sequences_per_call, max_model_len
+        self.enable_chunked_prefill = enable_chunked_prefill
         self.closed, self.llm, self.installed = False, None, False
         self.gpu_memory_utilization = gpu_memory_utilization
-        # Short-prefill extraction needs a small cache; leave space for captures/workspace.
-        self.kv_cache_memory_bytes = kv_cache_memory_bytes or 1536 * 2**20
+        # None lets vLLM size its cache from gpu_memory_utilization. Preserve
+        # any explicit value instead of silently replacing it.
+        self.kv_cache_memory_bytes = kv_cache_memory_bytes
         self.engine_startup_seconds = self.hook_install_seconds = 0.0
         self.generate_seconds = self.worker_forward_seconds = 0.0
         self.worker_collection_seconds = self.driver_read_seconds = 0.0
         self.worker_copy_seconds = self.worker_write_seconds = 0.0
         self.backpressure_seconds = self.final_drain_seconds = 0.0
         self.peak_gpu_memory_bytes = self.peak_gpu_reserved_bytes = self.peak_device_memory_bytes = 0
+        self.total_device_memory_bytes = 0
+        self.peak_device_memory_fraction = 0.0
         self.actual_forward_batches = []
         self.failed = False
         self.tasks = set()
@@ -61,7 +65,8 @@ class VLLMExtractor:
         args = AsyncEngineArgs(
             model=model, revision=revision, tokenizer_revision=revision, dtype=dtype,
             trust_remote_code=trust_remote_code, tensor_parallel_size=1, enforce_eager=True,
-            enable_prefix_caching=False, enable_chunked_prefill=False, skip_tokenizer_init=True,
+            enable_prefix_caching=False, enable_chunked_prefill=self.enable_chunked_prefill,
+            skip_tokenizer_init=True,
             max_model_len=self.max_model_len, max_num_seqs=self.sequences_per_call,
             max_num_batched_tokens=self.sequences_per_call * self.max_model_len,
             gpu_memory_utilization=self.gpu_memory_utilization,
@@ -72,8 +77,7 @@ class VLLMExtractor:
         self.params = SamplingParams(max_tokens=1, temperature=0)
         started = time.perf_counter()
         self.topology = (await self.llm.collective_rpc(
-            "nh_install", args=([asdict(s) for s in self.sites], self.sink.name,
-                                self.gpu_memory_utilization)))[0]
+            "nh_install", args=([asdict(s) for s in self.sites], self.sink.name)))[0]
         self.hook_install_seconds = time.perf_counter() - started
         self.installed = True
 
@@ -87,7 +91,8 @@ class VLLMExtractor:
             self.worker_write_seconds += receipt["write_seconds"]
             self.worker_forward_seconds += receipt["worker_forward_seconds"]
             self.actual_forward_batches.extend(receipt["actual_forward_batches"])
-            for name in ("peak_gpu_memory_bytes", "peak_gpu_reserved_bytes", "peak_device_memory_bytes"):
+            for name in ("peak_gpu_memory_bytes", "peak_gpu_reserved_bytes", "peak_device_memory_bytes",
+                         "total_device_memory_bytes", "peak_device_memory_fraction"):
                 setattr(self, name, max(getattr(self, name), receipt[name]))
         return ready
 

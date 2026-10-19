@@ -29,7 +29,7 @@ def assemble_rows(steps, token_ids, keys):
 
 
 class ActivationHookExtension:
-    def nh_install(self, sites, sink_dir, memory_fraction=0.96):
+    def nh_install(self, sites, sink_dir):
         self.nh_captured = {}
         self.nh_pool = BufferPool()
         self.nh_active = None
@@ -37,7 +37,6 @@ class ActivationHookExtension:
         self.nh_copy = ThreadPoolExecutor(max_workers=1)
         self.nh_writer = ThreadPoolExecutor(max_workers=1)
         self.nh_stream = torch.cuda.Stream()
-        self.nh_memory_fraction = memory_fraction
         self.nh_origin = torch.cuda.Event(enable_timing=True)
         self.nh_origin.record()
         torch.cuda.synchronize()
@@ -74,7 +73,7 @@ class ActivationHookExtension:
                           "covered": set(), "forward_events": [], "forward_batches": [],
                           "copy_events": [], "origin": self.nh_origin,
                           "origin_cpu": self.nh_origin_cpu,
-                          "device_peak": 0, "reserved_peak": 0}
+                          "device_peak": 0, "device_total": 0, "reserved_peak": 0}
         return True
 
     def _nh_inputs(self, module, args, kwargs):
@@ -141,9 +140,8 @@ class ActivationHookExtension:
         wave["copy_events"].append((started, ended))
         free, total = torch.cuda.mem_get_info()
         wave["device_peak"] = max(wave["device_peak"], total - free)
+        wave["device_total"] = max(wave["device_total"], total)
         wave["reserved_peak"] = max(wave["reserved_peak"], torch.cuda.max_memory_reserved())
-        if total - free > total * self.nh_memory_fraction:
-            raise RuntimeError("GPU memory budget exceeded (96% target)")
 
     def nh_seal(self, wave_id):
         wave = self.nh_active
@@ -168,7 +166,10 @@ class ActivationHookExtension:
                        actual_forward_batches=wave["forward_batches"], topology=wave["topology"],
                        peak_gpu_memory_bytes=wave["allocated_peak"],
                        peak_gpu_reserved_bytes=wave["reserved_peak"],
-                       peak_device_memory_bytes=wave["device_peak"])
+                       peak_device_memory_bytes=wave["device_peak"],
+                       total_device_memory_bytes=wave["device_total"],
+                       peak_device_memory_fraction=(wave["device_peak"] / wave["device_total"]
+                                                    if wave["device_total"] else 0.0))
         receipt["timeline"] = [
             {"name": name, "start": wave["origin"].elapsed_time(start) / 1000,
              "end": wave["origin"].elapsed_time(end) / 1000}

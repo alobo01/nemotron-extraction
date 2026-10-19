@@ -92,6 +92,9 @@ def test_request_order_duplicates_and_internal_suffix(worker, tmp_path):
     assert result["L0_resid_pre"].flatten().tolist() == [2, 3, 4, 5, 2, 3]
     assert result["L0_resid_post"].flatten().tolist() == [4, 7, 10, 13, 4, 7]
     assert receipt["actual_forward_batches"] == [3]
+    assert receipt["peak_device_memory_bytes"] == 20
+    assert receipt["total_device_memory_bytes"] == 100
+    assert receipt["peak_device_memory_fraction"] == pytest.approx(.2)
     assert sorted(worker.nh_pool.free) == [0, 1]
 
 

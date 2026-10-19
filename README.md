@@ -46,7 +46,9 @@ Inputs are rectangular int64 batches without padding; outputs in host memory hav
 Use separate calls for different lengths.
 
 Extraction requires eager execution, tensor parallelism of one, and disabled
-prefix caching and chunked prefill. Only prompt activations are captured.
+prefix caching. Chunked prefill is off by default; enable it for models that
+require it. The full prompt batch must fit in one prefill pass; partial-prefill
+captures are rejected. Only prompt activations are captured.
 
 ## Validation
 

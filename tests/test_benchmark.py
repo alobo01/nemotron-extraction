@@ -10,12 +10,30 @@ benchmark = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(benchmark)
 
 
+
 def test_exact_million_tokens_and_short_tail():
     tokens = torch.arange(1_000_000)
     batches = list(benchmark.batches(tokens, 4, 2048))
     assert sum(batch.numel() for batch in batches) == 1_000_000
     assert batches[-1].shape == (1, 576)
     assert torch.equal(torch.cat([batch.flatten() for batch in batches]), tokens)
+
+
+def test_comparison_cache_size_is_automatic_unless_explicit(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / "benchmarks"))
+    comparison_spec = importlib.util.spec_from_file_location(
+        "comparison", Path(__file__).parents[1] / "benchmarks/compare_repositories.py"
+    )
+    comparison = importlib.util.module_from_spec(comparison_spec)
+    comparison_spec.loader.exec_module(comparison)
+    monkeypatch.delenv("NH_KV_CACHE_BYTES", raising=False)
+    assert comparison.configured_kv_cache_bytes() is None
+    monkeypatch.setenv("NH_KV_CACHE_BYTES", "4096")
+    assert comparison.configured_kv_cache_bytes() == 4096
+    monkeypatch.delenv("NH_ENABLE_CHUNKED_PREFILL", raising=False)
+    assert comparison.configured_chunked_prefill() is True
+    monkeypatch.setenv("NH_ENABLE_CHUNKED_PREFILL", "false")
+    assert comparison.configured_chunked_prefill() is False
 
 
 def test_agreement_identical_zeros_and_known_error():

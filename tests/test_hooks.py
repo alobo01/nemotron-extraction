@@ -203,7 +203,8 @@ def test_vllm_driver_transport_cleanup_and_installed_worker(monkeypatch, tmp_pat
                 save_file({"token_ids": self.tokens, "L0_resid_post": self.tokens.reshape(-1, 1).float()}, self.path)
                 self.ready = getattr(self, "ready", []) + [{"path": self.path, "wave_id": self.wave, "topology": {},
                                "peak_gpu_memory_bytes": 123, "peak_gpu_reserved_bytes": 123,
-                               "peak_device_memory_bytes": 123, "actual_forward_batches": [len(self.tokens)],
+                               "peak_device_memory_bytes": 123, "total_device_memory_bytes": 1000,
+                               "peak_device_memory_fraction": .123, "actual_forward_batches": [len(self.tokens)],
                                "worker_copy_seconds": 0.0, "write_seconds": 0.0, "worker_forward_seconds": 0.0}]
                 return [True]
             if method == "nh_poll":
@@ -222,14 +223,19 @@ def test_vllm_driver_transport_cleanup_and_installed_worker(monkeypatch, tmp_pat
         result = extractor.extract(tokens)
         assert result.activations["L0_resid_post"].flatten().tolist() == tokens.flatten().tolist()
         assert extractor.peak_gpu_memory_bytes == 123
+        assert extractor.peak_device_memory_fraction == .123
     assert instances[0].stopped
     assert not list(tmp_path.iterdir())
     assert instances[0].kwargs["enable_prefix_caching"] is False
     assert instances[0].kwargs["enforce_eager"] is True
+    assert instances[0].kwargs["kv_cache_memory_bytes"] is None
+    with VLLMExtractor("fixture", [HookSite(0, "resid_post")], sink_dir=tmp_path,
+                       sequences_per_call=2, enable_chunked_prefill=True):
+        assert instances[1].kwargs["enable_chunked_prefill"] is True
 
 
 @pytest.mark.parametrize("kwargs", [{"enforce_eager": False}, {"tensor_parallel_size": 2},
-                                    {"enable_prefix_caching": True}, {"enable_chunked_prefill": True}])
+                                    {"enable_prefix_caching": True}])
 def test_unsupported_vllm_options_rejected_before_import(kwargs):
     with pytest.raises(ValueError, match="Requires"):
         VLLMExtractor("fixture", [HookSite(0, "resid_post")], **kwargs)
