@@ -207,8 +207,4 @@ class ActivationHookExtension:
             self.nh_captured.clear()
             self.nh_active = None
             self.nh_pending.clear()
-            # Transfers and writers have drained; no slot can still be read.
-            with self.nh_pool.lock:
-                self.nh_pool.free = [0, 1]
-                for slot in self.nh_pool.slots:
-                    slot.clear()
+            self.nh_pool.reset()

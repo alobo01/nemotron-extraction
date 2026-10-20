@@ -271,10 +271,7 @@ class HFExtractor:
         self.producer.shutdown(wait=True)
         self.copy_worker.shutdown(wait=True)
         self.writer.shutdown(wait=True)
-        with self.pool.lock:
-            self.pool.free = [0, 1]
-            for slot in self.pool.slots:
-                slot.clear()
+        self.pool.reset()
         for handle in self.handles:
             handle.remove()
         self.captured.clear()

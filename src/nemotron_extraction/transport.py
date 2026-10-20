@@ -37,6 +37,12 @@ class BufferPool:
                 raise RuntimeError("Buffer slot released twice")
             self.free.append(slot)
 
+    def reset(self):
+        """Only call once transfers and writers have drained; no slot can still be read."""
+        with self.lock:
+            self.free = [0, 1]
+            for slot in self.slots:
+                slot.clear()
 
 
 def seconds(started, ended):
