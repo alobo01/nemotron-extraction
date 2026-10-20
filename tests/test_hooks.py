@@ -205,7 +205,8 @@ def test_vllm_driver_transport_cleanup_and_installed_worker(monkeypatch, tmp_pat
                                "peak_gpu_memory_bytes": 123, "peak_gpu_reserved_bytes": 123,
                                "peak_device_memory_bytes": 123, "total_device_memory_bytes": 1000,
                                "peak_device_memory_fraction": .123, "actual_forward_batches": [len(self.tokens)],
-                               "worker_copy_seconds": 0.0, "write_seconds": 0.0, "worker_forward_seconds": 0.0}]
+                               "worker_copy_seconds": 0.0, "write_seconds": 0.0, "worker_forward_seconds": 0.0,
+                               "validation_seconds": 0.0, "serialization_seconds": 0.0}]
                 return [True]
             if method == "nh_poll":
                 ready = getattr(self, "ready", [])

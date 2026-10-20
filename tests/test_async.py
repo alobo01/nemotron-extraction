@@ -23,7 +23,8 @@ def test_two_slots_are_reused_only_after_release():
         pool.release(b)
 
 
-def test_hf_async_extract_and_direct_disk_rows(tmp_path):
+@pytest.mark.parametrize('publication_threads',[1,2])
+def test_hf_async_extract_and_direct_disk_rows(tmp_path,publication_threads):
     async def run(extractor):
         tokens = torch.tensor([[1, 2], [1, 2], [4, 5]])
         batch = await extractor.extract_async(tokens)
@@ -36,18 +37,19 @@ def test_hf_async_extract_and_direct_disk_rows(tmp_path):
             assert torch.equal(saved["token_ids"], expected)
             assert saved["L0_resid_post"].shape == (expected.numel(), 2)
         assert torch.equal(batch.token_ids, tokens)
-    with HFExtractor(Model(), [HookSite(0, "resid_post")], device="cpu") as extractor:
+    with HFExtractor(Model(), [HookSite(0, "resid_post")], device="cpu",publication_threads=publication_threads) as extractor:
         asyncio.run(run(extractor))
 
 
-def test_hf_writer_failure_releases_buffers(monkeypatch, tmp_path):
+@pytest.mark.parametrize('publication_threads',[1,2])
+def test_hf_writer_failure_releases_buffers(monkeypatch, tmp_path,publication_threads):
     import nemotron_extraction.hf as hf
     monkeypatch.setattr(hf, "publish", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
     async def run(extractor):
         with pytest.raises(OSError, match="disk full"):
             async for _ in extractor.stream_to_disk([torch.tensor([[1, 2]])], tmp_path):
                 pass
-    with HFExtractor(Model(), [HookSite(0, "resid_post")], device="cpu") as extractor:
+    with HFExtractor(Model(), [HookSite(0, "resid_post")], device="cpu",publication_threads=publication_threads) as extractor:
         asyncio.run(run(extractor))
         assert sorted(extractor.pool.free) == [0, 1]
 

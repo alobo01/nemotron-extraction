@@ -10,6 +10,8 @@ from torch import nn
 from safetensors.torch import load_file
 
 from nemotron_extraction.diagnostics import TokenDiagnostics, TraceHooks, DiagnosticWorker, runtime_config
+from nemotron_extraction.moe_diagnostics import (four_way_replay, manual_nemotron_moe,
+    manual_sigmoid_router, routing_report)
 
 sys.path.insert(0,str(Path(__file__).parents[1]/'benchmarks'))
 import diagnose_divergence as diagnostic
@@ -116,7 +118,7 @@ def test_scheduler_records_reordered_duplicates_and_rejects_partial_prefill():
 def test_case_definitions_keep_anchor_identity_and_short_tail():
     rows=torch.arange(64*2048).reshape(64,2048)
     for name,tokens,anchor in diagnostic.cases(rows):
-        expected=rows[0,:37] if name=='short37' else rows[0]
+        expected=rows[0,:37] if name=='short37' else (rows[0,:128] if name=='short128' else rows[0])
         assert torch.equal(tokens[anchor],expected)
     assert diagnostic.boundary_order('L02_mixer_input')<diagnostic.boundary_order('L02_mixer_out')
 
@@ -165,3 +167,70 @@ def test_same_forward_comparison_detects_disagreement_before_transport():
     worker.diag_sibling=SimpleNamespace(sae_captured={'site':torch.zeros(2,3)})
     with pytest.raises(RuntimeError,match='callbacks differ'):
         worker._diag_equal(None,None,None)
+
+
+def test_router_report_uses_observed_ids_and_reports_selection_margin():
+    logits=torch.tensor([[3.,2.,1.,0.],[0.,1.,2.,3.]])
+    bias=torch.tensor([0.,0.,0.,0.])
+    ids=torch.tensor([[0,1],[3,2]])
+    probs=logits.sigmoid()
+    weights=probs.gather(1,ids);weights=weights/weights.sum(1,keepdim=True)
+    report=routing_report(logits,bias,ids,weights)
+    assert report['unconstrained_set_agreement'].tolist()==[True,True]
+    assert torch.all(report['global_sixth_seventh_margin']>0)
+    assert torch.equal(report['selected_ids'],ids)
+    assert torch.allclose(report['normalized_sigmoid_weights'],weights)
+
+
+def test_manual_sigmoid_router_uses_correction_for_selection_only():
+    x=torch.tensor([[1.,0.]])
+    weight=torch.tensor([[1.,0.],[0.,1.],[.5,0.]])
+    correction=torch.tensor([0.,2.,0.])
+    result=manual_sigmoid_router(x,weight,correction,top_k=2,routed_scale=2.5)
+    assert set(result['ids'][0].tolist())=={0,1}
+    expected=result['scores'].gather(1,result['ids'])
+    expected=expected/expected.sum(1,keepdim=True)*2.5
+    assert torch.allclose(result['weights'],expected)
+    assert not torch.equal(result['weights'],torch.full_like(result['weights'],1.25))
+
+
+def test_manual_nemotron_moe_matches_explicit_non_gated_equations():
+    torch.manual_seed(19)
+    x=torch.randn(5,4,dtype=torch.float32)
+    up=torch.randn(3,6,4);down=torch.randn(3,4,6)
+    shared_up=torch.randn(7,4);shared_down=torch.randn(4,7)
+    ids=torch.tensor([[0,1],[1,2],[2,0],[0,2],[1,0]])
+    weights=torch.rand(5,2);weights=weights/weights.sum(1,keepdim=True)
+    result=manual_nemotron_moe(x,ids,weights,up,down,shared_up_weight=shared_up,
+                               shared_down_weight=shared_down,routed_scale=2.5)
+    ref=torch.zeros_like(x)
+    for row in range(len(x)):
+        for slot in range(ids.shape[1]):
+            expert=ids[row,slot]
+            mid=torch.nn.functional.linear(x[row:row+1],up[expert])
+            out=torch.nn.functional.linear(torch.relu(mid).square(),down[expert])
+            ref[row]+=out[0]*(weights[row,slot]*2.5)
+    ref=ref+torch.nn.functional.linear(torch.relu(torch.nn.functional.linear(x,shared_up)).square(),shared_down)
+    assert torch.allclose(result['output'],ref)
+    assert torch.allclose(result['weighted_slot_contributions'].sum(1),result['routed_float32'])
+
+
+def test_four_way_replay_separates_input_and_implementation_effects():
+    xh=torch.tensor([[1.,2.],[-1.,3.]])
+    xv=xh+torch.tensor([[.1,0.],[0.,-.2]])
+    ref=lambda x: x.square()
+    candidate=lambda x: x.square()+torch.tensor([[0.,.3],[.2,0.]])
+    values=four_way_replay(xh,xv,ref,candidate)
+    assert torch.equal(values['reconstruction_error'],torch.zeros_like(xh))
+    assert torch.equal(values['input_effect'],ref(xv)-ref(xh))
+    assert torch.equal(values['implementation_effect_on_candidate_input'],candidate(xv)-ref(xv))
+
+
+def test_anchor_rule_is_reported_alongside_unchanged_strict_gates():
+    reference=torch.ones(100,8)
+    candidate=reference.clone();candidate[-1]*=-1
+    result=diagnostic.pair_metrics(reference,candidate)
+    assert result['rows_cosine_at_least_0_990']==99
+    assert result['passes_anchor_99_percent_rule']
+    assert not result['strict_mean_cosine_pass']
+    assert not result['strict_minimum_cosine_pass']

@@ -48,3 +48,17 @@ class ActivationBatch:
                 raise ValueError(f"{key}: expected CPU [{self.token_ids.numel()}, width] rows")
             if not bool(torch.isfinite(value).all()):
                 raise ValueError(f"{key}: activations contain nonfinite values")
+
+
+@dataclass
+class DeviceActivationBatch:
+    """CPU token IDs with detached device-resident rows for live SAE training."""
+    token_ids: torch.Tensor
+    activations: dict[str, torch.Tensor]
+
+    def __post_init__(self):
+        if self.token_ids.ndim != 2 or self.token_ids.device.type != "cpu":
+            raise ValueError("DeviceActivationBatch requires CPU token IDs")
+        for key, value in self.activations.items():
+            if value.ndim != 2 or value.shape[0] != self.token_ids.numel() or value.device.type != "cuda":
+                raise ValueError(f"{key}: expected CUDA [tokens, width] activations")

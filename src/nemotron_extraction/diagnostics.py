@@ -21,6 +21,8 @@ from torch import nn
 from safetensors.torch import load_file, save_file
 
 from .hooks import argument, install, layers_of, mixer_kind, projection_of
+from .moe_diagnostics import (decompose_four_outputs, manual_nemotron_moe,
+    manual_sigmoid_router, routing_report)
 from .types import HookSite
 from .worker import ActivationHookExtension
 
@@ -125,8 +127,26 @@ class TokenDiagnostics:
         def enriched(items):
             return [dict(r, error_energy_share=r['error_squared']/error2 if error2 else 0.) for r in items]
         mean, minimum = float(cos.mean()), float(cos.min())
+        one_percent_count = (len(rows) + 99) // 100
+        cosine_tail = sorted(rows, key=lambda r: (r['cosine'], r['row_id']))[:one_percent_count]
+        error_tail = sorted(rows, key=lambda r: (-r['error_squared'], r['row_id']))[:one_percent_count]
+        reference_energy_per_row = reference2 / len(rows)
+        normalized_row_errors = (torch.tensor([r['error_squared'] for r in rows], dtype=torch.float64)
+                                 / reference_energy_per_row) if reference_energy_per_row else None
         return dict(tokens=len(rows), width=self.width, dtype=self.dtype, mean_cosine=mean,
             cosine_std=float(cos.std(correction=0)), minimum_cosine=minimum,
+            maximum_cosine_disagreement=1-minimum,
+            normalized_mse_std=(float(normalized_row_errors.std(correction=0)) if normalized_row_errors is not None
+                                else (0. if not error2 else None)),
+            worst_one_percent=dict(count=one_percent_count, rounding='ceil(0.01 * token_rows)',
+                mean_cosine=sum(r['cosine'] for r in cosine_tail)/one_percent_count,
+                maximum_cosine_disagreement=1-minimum,
+                error_energy_share=sum(r['error_squared'] for r in error_tail)/error2 if error2 else 0.,
+                mean_normalized_squared_error=(sum(r['error_squared'] for r in error_tail)/one_percent_count/reference_energy_per_row
+                                               if reference_energy_per_row else (0. if not error2 else None)),
+                maximum_normalized_squared_error=(max(r['error_squared'] for r in rows)/reference_energy_per_row
+                                                  if reference_energy_per_row else (0. if not error2 else None)),
+                rows_by_cosine=enriched(cosine_tail), rows_by_squared_error=enriched(error_tail)),
             cosine_percentiles={str(p): float(cos.quantile(p/100)) for p in (0, .1, 1, 5, 50, 99, 100)},
             relative_l2=relative, normalized_mse=nmse, mse_normalization='shared_reference_rms_per_site',
             error_squared_sum=error2, reference_squared_sum=reference2,
@@ -183,6 +203,9 @@ def runtime_config(model, runner=None):
         state_dtypes=[str(value) for value in model.get_mamba_state_dtype_from_config(config)]
     return dict(model_class=type(model).__name__, sources=sources, modules=modules,
         weight_dtypes=sorted({str(p.dtype) for p in model.parameters()}),
+        parameter_bytes=sum(p.numel()*p.element_size() for p in model.parameters()),
+        device_memory=(dict(zip(('free_bytes','total_bytes'),torch.cuda.mem_get_info()))
+                       if torch.cuda.is_available() else None),
         cache_config=str(getattr(config,'cache_config',None)),
         resolved_mamba_state_dtypes=state_dtypes,
         model_config=str(getattr(config,'model_config',None)),
@@ -471,6 +494,40 @@ class DiagnosticWorker:
         report=dict(name=case['name'],scheduler=case['scheduler'],same_forward=case['equality'],
             topology=self.diag_trace.topology,path=str(path),trace_persistence_exact=True,
             operator_observability=self.diag_trace.detail_observability)
+        # Capture the real selector's logits, IDs, and weights while the
+        # worker still owns the loaded layer. This avoids inferring routes
+        # from an independently reimplemented top-k rule.
+        if self.diag_trace.detail_layer is not None:
+            layer_index=self.diag_trace.detail_layer
+            prefix=f'L{layer_index:02d}_detail_'
+            logits=self.diag_trace.values.get(prefix+'gate_0')
+            selection=[(key,value) for key,value in self.diag_trace.values.items()
+                       if key.startswith(prefix+'actual_router_selection_')]
+            ids=next((value for _,value in selection if value.dtype in
+                      (torch.int8,torch.int16,torch.int32,torch.int64,torch.uint8)),None)
+            weights=next((value for _,value in selection if value.is_floating_point()),None)
+            _,layers=layers_of(self.model_runner.model)
+            correction=getattr(getattr(layers[layer_index].mixer,'gate',None),
+                               'e_score_correction_bias',None)
+            if logits is not None and ids is not None and weights is not None and correction is not None:
+                routes=routing_report(logits,correction,ids,weights)
+                margins=routes['global_sixth_seventh_margin']
+                agreement=routes['unconstrained_set_agreement']
+                report['routing']={
+                    'rows':int(ids.shape[0]),'top_k':int(ids.shape[1]),
+                    'ids_dtype':str(ids.dtype),'weights_dtype':str(weights.dtype),
+                    'logits_dtype':str(logits.dtype),
+                    'global_kth_to_best_excluded_margin_min':float(margins.min()),
+                    'global_kth_to_best_excluded_margin_mean':float(margins.mean()),
+                    'unconstrained_global_topk_set_agreement':int(agreement.sum()),
+                    'unconstrained_global_topk_rows':int(agreement.numel()),
+                    'observed_expert_ids':ids.cpu().tolist(),
+                    'observed_routing_weights':weights.cpu().tolist(),
+                    'global_kth_to_best_excluded_margin':margins.cpu().tolist(),
+                }
+                report['routing']['note']=(
+                    'Global score margins do not encode grouped eligibility; '
+                    'observed selected IDs and weights are the backend selector output.')
         if self.diag_sibling is not None:
             source=sibling_namespace(self.diag_reference)
             rows=torch.tensor(list(case['requests'].values()),dtype=torch.long)
@@ -509,11 +566,253 @@ class DiagnosticWorker:
         self.diag_trace.close()
         self.diag_case=None
 
+    def diag_moe_replay(self, transformer_trace, vllm_trace, output_path, layer_index=1):
+        """Compare transparent PyTorch expert equations with this worker's fused MoE."""
+        base,layers=layers_of(self.model_runner.model)
+        mixer=layers[layer_index].mixer
+        params=dict(mixer.named_parameters())
+        w13_name=next((n for n in params if n.endswith('w13_weight')),None)
+        w2_name=next((n for n in params if n.endswith('w2_weight')),None)
+        if w13_name is None or w2_name is None:
+            raise RuntimeError('Cannot resolve loaded routed expert weights')
+        w13,w2=params[w13_name],params[w2_name]
+        if (w13.ndim!=3 or w2.ndim!=3 or w13.shape[0]!=w2.shape[0]
+            or w13.shape[1]!=w2.shape[2] or w13.shape[2]!=w2.shape[1]):
+            raise RuntimeError(f'Unsupported non-gated expert weight layout: {tuple(w13.shape)} / {tuple(w2.shape)}')
+        if w13.dtype!=torch.bfloat16 or w2.dtype!=torch.bfloat16:
+            raise RuntimeError(f'Expected BF16 expert weights, got {w13.dtype} / {w2.dtype}')
+        router=getattr(mixer.experts,'router',None)
+        select=getattr(router,'select_experts',None)
+        if not callable(select):
+            raise RuntimeError('Cannot intercept this vLLM router selector')
+        shared=getattr(mixer,'shared_experts',None)
+        def projection(name):
+            module=getattr(shared,name,None) if shared is not None else None
+            return (getattr(module,'weight',None),getattr(module,'bias',None)) if module is not None else (None,None)
+        shared_up,shared_up_bias=projection('up_proj')
+        shared_down,shared_down_bias=projection('down_proj')
+        if (shared_up is None)!=(shared_down is None):
+            raise RuntimeError('Could not resolve both shared expert projections')
+
+        h=load_file(str(transformer_trace));v=load_file(str(vllm_trace))
+        input_key=f'L{layer_index:02d}_mixer_input';output_key=f'L{layer_index:02d}_mixer_out'
+        if any(key not in trace for trace in (h,v) for key in (input_key,output_key)):
+            raise RuntimeError('Saved traces lack the selected layer input/output')
+        if 'token_ids' not in h or 'token_ids' not in v or not torch.equal(h['token_ids'],v['token_ids']):
+            raise RuntimeError('Saved traces do not have identical anchor token IDs')
+        xh=h[input_key].to(device=w13.device,dtype=w13.dtype)
+        xv=v[input_key].to(device=w13.device,dtype=w13.dtype)
+        if xh.ndim!=2 or xv.shape!=xh.shape or xh.shape[-1]!=w13.shape[2]:
+            raise RuntimeError('Saved normalized inputs do not match loaded expert dimensions')
+
+        model_config=getattr(getattr(getattr(self.model_runner,'vllm_config',None),'model_config',None),
+                             'hf_config',None)
+        if model_config is None:
+            raise RuntimeError('Cannot verify the pinned model routing configuration')
+        if int(getattr(model_config,'n_group',0))!=1 or int(getattr(model_config,'topk_group',0))!=1:
+            raise RuntimeError('Manual router currently requires the pinned one-group Nemotron router')
+        gate_weight=getattr(mixer.gate,'weight',None)
+        if gate_weight is None:
+            raise RuntimeError('Cannot resolve the loaded FP32 router matrix')
+        correction=mixer.gate.e_score_correction_bias
+        top_k=int(getattr(model_config,'num_experts_per_tok',0))
+        if top_k<=0: raise RuntimeError('Cannot resolve the checkpoint top-k value')
+        expected=(int(getattr(model_config,'n_routed_experts',w13.shape[0])),
+                  int(getattr(model_config,'moe_intermediate_size',w13.shape[1])),
+                  int(getattr(model_config,'hidden_size',w13.shape[2])))
+        observed=(int(w13.shape[0]),int(w13.shape[1]),int(w13.shape[2]))
+        if observed!=expected:
+            raise RuntimeError(f'Loaded expert weight dimensions {observed} disagree with checkpoint config {expected}')
+        routed_scale=float(getattr(mixer,'routed_scaling_factor',1.0))
+
+        def manual_route(x,enabled=False):
+            old_tf32=torch.backends.cuda.matmul.allow_tf32
+            old_precision=torch.get_float32_matmul_precision()
+            try:
+                torch.backends.cuda.matmul.allow_tf32=enabled
+                torch.set_float32_matmul_precision('high' if enabled else 'highest')
+                return manual_sigmoid_router(x,gate_weight,correction,top_k,
+                    gate_bias=getattr(mixer.gate,'bias',None),routed_scale=1.0)
+            finally:
+                torch.backends.cuda.matmul.allow_tf32=old_tf32
+                torch.set_float32_matmul_precision(old_precision)
+
+        def native(x):
+            observed={}
+            def capture_selection(*args,**kwargs):
+                result=select(*args,**kwargs)
+                if 'router_logits' in kwargs: observed['logits']=kwargs['router_logits'].detach()
+                if isinstance(result,(tuple,list)) and len(result)>=2:
+                    observed['weights'],observed['ids']=result[0].detach(),result[1].detach()
+                return result
+            router.select_experts=capture_selection
+            try:
+                with torch.inference_mode(): output=mixer(x)
+            finally:
+                router.select_experts=select
+            if 'ids' not in observed:
+                raise RuntimeError('Selector did not return observed weights and IDs')
+            return output,observed
+
+        def manual(x,routes):
+            return manual_nemotron_moe(x,routes['ids'],routes['weights'],w13,w2,
+                shared_up_weight=shared_up,shared_down_weight=shared_down,
+                shared_up_bias=shared_up_bias,shared_down_bias=shared_down_bias,
+                routed_scale=routed_scale,output_dtype=x.dtype)
+
+        with torch.inference_mode():
+            native_h,routes_h=native(xh);native_v,routes_v=native(xv)
+            manual_router_h=manual_route(xh);manual_router_v=manual_route(xv)
+            manual_h=manual(xh,manual_router_h);manual_v=manual(xv,manual_router_v)
+            matched_h=manual(xh,routes_h);matched_v=manual(xv,routes_v)
+            values=decompose_four_outputs(manual_h['output'],manual_v['output'],native_h,native_v)
+            tf32_results={}
+            for enabled in (False,True):
+                tf32_results[str(enabled)]=manual_route(xh,enabled=enabled)
+        tensors={
+            'token_ids':h['token_ids'],
+            'saved_transformers_output':h[output_key],'saved_vllm_output':v[output_key],
+            'manual_on_transformers_input':manual_h['output'].cpu(),
+            'native_on_transformers_input':native_h.cpu(),
+            'manual_on_vllm_input':manual_v['output'].cpu(),
+            'native_on_vllm_input':native_v.cpu(),
+            'route_matched_manual_on_transformers_input':matched_h['output'].cpu(),
+            'route_matched_manual_on_vllm_input':matched_v['output'].cpu(),
+            'input_effect':values['input_effect'].cpu(),
+            'implementation_effect_on_candidate_input':values['implementation_effect_on_candidate_input'].cpu(),
+            'implementation_effect_on_reference_input':values['implementation_effect_on_reference_input'].cpu(),
+            'interaction_effect':values['interaction_effect'].cpu(),
+            'route_ids_transformers_input':routes_h['ids'].cpu(),
+            'route_weights_transformers_input':routes_h['weights'].cpu(),
+            'route_ids_vllm_input':routes_v['ids'].cpu(),
+            'route_weights_vllm_input':routes_v['weights'].cpu(),
+            'manual_route_ids_transformers_input':manual_router_h['ids'].cpu(),
+            'manual_route_weights_transformers_input':manual_router_h['weights'].cpu(),
+            'manual_route_ids_vllm_input':manual_router_v['ids'].cpu(),
+            'manual_route_weights_vllm_input':manual_router_v['weights'].cpu(),
+            'router_logits_vllm_transformers_input':routes_h['logits'].cpu(),
+            'router_logits_vllm_vllm_input':routes_v['logits'].cpu(),
+            'vllm_kth_to_best_excluded_margin_transformers_input':routing_report(
+                routes_h['logits'],correction,routes_h['ids'],routes_h['weights'])['global_sixth_seventh_margin'].cpu(),
+            'vllm_kth_to_best_excluded_margin_vllm_input':routing_report(
+                routes_v['logits'],correction,routes_v['ids'],routes_v['weights'])['global_sixth_seventh_margin'].cpu(),
+            'router_logits_tf32_off':tf32_results['False']['logits'].cpu(),
+            'router_logits_tf32_on':tf32_results['True']['logits'].cpu(),
+            'route_ids_tf32_off':tf32_results['False']['ids'].cpu(),
+            'route_ids_tf32_on':tf32_results['True']['ids'].cpu(),
+            'route_weights_tf32_off':tf32_results['False']['weights'].cpu(),
+            'route_weights_tf32_on':tf32_results['True']['weights'].cpu(),
+            'routed_manual_transformers_input':manual_h['routed_cast'].cpu(),
+            'routed_manual_vllm_input':manual_v['routed_cast'].cpu(),
+            'routed_route_matched_transformers_input':matched_h['routed_cast'].cpu(),
+            'routed_route_matched_vllm_input':matched_v['routed_cast'].cpu(),
+        }
+        path=Path(output_path);path.parent.mkdir(parents=True,exist_ok=True)
+        partial=path.with_suffix(path.suffix+'.partial')
+        save_file(tensors,str(partial),metadata={
+            'layer':str(layer_index),'up_parameter':w13_name,'down_parameter':w2_name,
+            'up_dtype':str(w13.dtype),'down_dtype':str(w2.dtype),
+            'up_shape':str(tuple(w13.shape)),'down_shape':str(tuple(w2.shape)),
+            'torch_version':str(torch.__version__),'cuda_version':str(torch.version.cuda),
+            'tf32_matmul':str(torch.backends.cuda.matmul.allow_tf32),
+        })
+        partial.replace(path)
+        same_rows=(torch.sort(routes_h['ids'].long(),dim=-1).values
+                   ==torch.sort(routes_v['ids'].long(),dim=-1).values).all(dim=-1)
+        tf32_same=(torch.sort(tf32_results['False']['ids'].long(),dim=-1).values
+                   ==torch.sort(tf32_results['True']['ids'].long(),dim=-1).values).all(dim=-1)
+        logits_delta=(tf32_results['False']['logits'].float()-tf32_results['True']['logits'].float()).abs()
+        router_match_h=(torch.sort(routes_h['ids'].long(),dim=-1).values
+                        ==torch.sort(manual_router_h['ids'].long(),dim=-1).values).all(dim=-1)
+        router_match_v=(torch.sort(routes_v['ids'].long(),dim=-1).values
+                        ==torch.sort(manual_router_v['ids'].long(),dim=-1).values).all(dim=-1)
+        def aligned_weight_delta(native_routes,manual_routes):
+            native_order=native_routes['ids'].long().argsort(dim=-1)
+            manual_order=manual_routes['ids'].long().argsort(dim=-1)
+            native_ids=native_routes['ids'].long().gather(1,native_order)
+            manual_ids=manual_routes['ids'].long().gather(1,manual_order)
+            equal=native_ids==manual_ids
+            native_weights=native_routes['weights'].float().gather(1,native_order)
+            manual_weights=manual_routes['normalized_weights'].gather(1,manual_order)
+            return (native_weights-manual_weights).abs()[equal]
+        weight_deltas=[aligned_weight_delta(routes_h,manual_router_h),
+                       aligned_weight_delta(routes_v,manual_router_v)]
+        weight_deltas=[d for d in weight_deltas if d.numel()]
+        selected_for_fingerprint=set()
+        for position in (571,1467,2005,2021):
+            if position<len(xh):
+                selected_for_fingerprint.update(routes_h['ids'][position].long().tolist())
+                selected_for_fingerprint.update(routes_v['ids'][position].long().tolist())
+                selected_for_fingerprint.update(manual_router_h['ids'][position].long().tolist())
+        def tensor_sha(tensor):
+            return hashlib.sha256(tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
+        router_fingerprints={
+            'gate_weight_sha256':tensor_sha(gate_weight),
+            'correction_bias_sha256':tensor_sha(correction),
+            'correction_bias_values':correction.detach().float().cpu().tolist(),
+            'experts':{
+                str(expert):{'up_sha256':tensor_sha(w13[expert]),'down_sha256':tensor_sha(w2[expert]),
+                    'up_dtype':str(w13.dtype),'down_dtype':str(w2.dtype),
+                    'up_shape':list(w13[expert].shape),'down_shape':list(w2[expert].shape)}
+                for expert in sorted(selected_for_fingerprint)
+            },
+            'expert_ids_fingerprinted_at_anchor_positions':[571,1467,2005,2021],
+        }
+        return {
+            'status':'complete','layer':layer_index,'tokens':int(xh.shape[0]),'hidden_width':int(xh.shape[1]),
+            'module_path':f'{base}.{layer_index}.mixer',
+            'top_k':int(routes_h['ids'].shape[1]),'expert_weight_names':{'up':w13_name,'down':w2_name},
+            'expert_weight_shapes':{'up':list(w13.shape),'down':list(w2.shape)},
+            'expert_weight_dtypes':{'up':str(w13.dtype),'down':str(w2.dtype)},
+            'loaded_weight_fingerprints':router_fingerprints,
+            'checkpoint_config_dimensions':{
+                'hidden_size':int(getattr(model_config,'hidden_size',-1)),
+                'routed_experts':int(getattr(model_config,'n_routed_experts',-1)),
+                'intermediate_size':int(getattr(model_config,'moe_intermediate_size',-1)),
+                'top_k':int(top_k),'n_group':int(getattr(model_config,'n_group',-1)),
+                'topk_group':int(getattr(model_config,'topk_group',-1)),
+            },
+            'shared_expert_present':shared_up is not None,
+            'routed_scaling_factor':float(getattr(mixer,'routed_scaling_factor',1.0)),
+            'expert_set_agreement_rows':int(same_rows.sum()),'expert_set_total_rows':int(same_rows.numel()),
+            'manual_router_vs_vllm':{
+                'transformers_input_matching_set_rows':int(router_match_h.sum()),
+                'vllm_input_matching_set_rows':int(router_match_v.sum()),
+                'rows':int(xh.shape[0]),
+                'max_weight_difference_on_matching_selected_experts':float(max(d.max() for d in weight_deltas)) if weight_deltas else None,
+                'vllm_logits_vs_manual_fp32_max_abs_transformers_input':float((routes_h['logits'].float()-manual_router_h['logits']).abs().max()),
+                'vllm_logits_vs_manual_fp32_max_abs_vllm_input':float((routes_v['logits'].float()-manual_router_v['logits']).abs().max()),
+                'correction_bias_applies_to_selection_only':True,
+            },
+            'selected_expert_margin':{
+                'meaning':'minimum selected corrected sigmoid score minus maximum excluded corrected sigmoid score; global one-group ranking',
+                'transformers_input_minimum':float(tensors['vllm_kth_to_best_excluded_margin_transformers_input'].min()),
+                'vllm_input_minimum':float(tensors['vllm_kth_to_best_excluded_margin_vllm_input'].min()),
+                'positions_of_interest':{
+                    str(position):{
+                        'transformers_input':float(tensors['vllm_kth_to_best_excluded_margin_transformers_input'][position]),
+                        'vllm_input':float(tensors['vllm_kth_to_best_excluded_margin_vllm_input'][position]),
+                    } for position in (571,1467,2005,2021) if position<len(xh)
+                },
+            },
+            'tf32_router_control':{
+                'different_expert_set_rows':int((~tf32_same).sum()),'rows':int(tf32_same.numel()),
+                'maximum_logit_absolute_difference':float(logits_delta.max()),
+                'mean_logit_absolute_difference':float(logits_delta.mean()),
+                'tested_input':'Transformers anchor normalized input',
+                'disabled':{'allow_tf32':False,'float32_matmul_precision':'highest'},
+                'permitted':{'allow_tf32':True,'float32_matmul_precision':'high'},
+                'caveat':'PyTorch high precision may select TF32 or another accelerated FP32 algorithm; the effective kernel must be confirmed from this runtime.',
+            },
+            'output_path':str(path),
+            'note':'Manual equations use observed vLLM router outputs; native fused outputs are on the same loaded weights/runtime.'
+        }
+
 
 class IntegrityWorker(ActivationHookExtension):
     """Verify production asynchronous copies against same-forward GPU snapshots."""
-    def nh_install(self,sites,sink_dir):
-        result=super().nh_install(sites,sink_dir)
+    def nh_install(self,sites,sink_dir,diagnostics=True,publication_threads=1):
+        result=super().nh_install(sites,sink_dir,diagnostics,publication_threads)
         self.nh_handles.append(self.model_runner.model.register_forward_hook(self._oracle,prepend=True))
         return result
 

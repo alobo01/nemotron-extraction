@@ -72,28 +72,49 @@ def argument(args, kwargs, index, name):
 def residual(hidden: torch.Tensor, running: torch.Tensor | None) -> torch.Tensor:
     return hidden.detach().clone() if running is None else (hidden + running).detach()
 
-def install(model, sites, captured, *, worker=False):
+def install(model, sites, captured, *, worker=False, capture_events=None):
     """Capture detached GPU copies; callers move them only after the forward pass."""
     handles, topology = [], {}
 
+    def start(value):
+        if capture_events is None or not value.is_cuda:
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    def finish(site, event):
+        if event is not None:
+            ended = torch.cuda.Event(enable_timing=True)
+            ended.record()
+            capture_events.append((site.key, event, ended))
+
     def pre(site, module, args, kwargs):
         if worker and site.kind == "resid_pre":
+            event = start(argument(args, kwargs, 1, "hidden_states"))
             value = residual(argument(args, kwargs, 1, "hidden_states"),
                              argument(args, kwargs, 2, "residual"))
             captured[site.key] = value
+            finish(site, event)
             return
         else:
             value = argument(args, kwargs, 0, "hidden_states")
+        event = start(value)
         captured[site.key] = value.detach().clone()
+        finish(site, event)
 
     def post(site, module, args, output):
         if worker and site.kind == "resid_post":
+            event = start(output[0])
             value = residual(*output)
             captured[site.key] = value
+            finish(site, event)
             return
         else:
             value = output[0] if isinstance(output, tuple) else output
+        event = start(value)
         captured[site.key] = value.detach().clone()
+        finish(site, event)
 
     try:
         for site in sites:

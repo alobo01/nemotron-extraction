@@ -57,10 +57,15 @@ def publish(tensors, path, metadata=None):
         for key, tensor in tensors.items():
             if tensor.is_floating_point() and not bool(torch.isfinite(tensor).all()):
                 raise ValueError(f"{key}: nonfinite activations")
+        validated = time.perf_counter()
         save_file(tensors, str(partial), metadata=metadata)
+        serialized = time.perf_counter()
         partial.replace(path)
     except BaseException:
         partial.unlink(missing_ok=True)
         raise
     return {"path": str(path), "bytes": path.stat().st_size,
+            "validation_seconds": validated - started,
+            "serialization_seconds": serialized - validated,
+            "publication_seconds": time.perf_counter() - serialized,
             "write_seconds": time.perf_counter() - started}

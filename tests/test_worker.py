@@ -115,3 +115,26 @@ def test_unknown_request_and_partial_prefill_are_rejected(worker, tmp_path):
         forward(worker, ["wrong"], [[1, 2]])
     with pytest.raises(RuntimeError, match="partial prefill"):
         forward(worker, ["a"], [[1, 2]], computed=[1])
+
+
+def test_detailed_token_validation_is_opt_in_but_scheduler_checks_remain(worker,tmp_path):
+    worker.nh_diagnostics=True
+    worker.nh_begin('tokens',['a'],[[1,2]],str(tmp_path/'tokens.safetensors'))
+    with pytest.raises(RuntimeError,match='token IDs differ'):
+        forward(worker,['a'],[[2,1]])
+    assert not worker.nh_active['covered']
+
+
+def test_fast_path_does_not_read_per_token_cpu_content(worker,tmp_path):
+    class SchedulerTokens:
+        def __getitem__(self,key):
+            raise AssertionError('Detailed token-content access on fast path')
+    worker.nh_begin('fast',['a'],[[1,2]],str(tmp_path/'fast.safetensors'))
+    worker.model_runner.input_batch=SimpleNamespace(req_ids=['a'],
+        token_ids_cpu=SchedulerTokens(),num_computed_tokens_cpu=[0])
+    worker.model_runner.query_start_loc=SimpleNamespace(cpu=torch.tensor([0,2]))
+    worker.model_runner.model(torch.tensor([1,2]),torch.tensor([0,1]))
+    worker.nh_seal('fast')
+    r=poll(worker)[0]
+    assert r['scheduler']==[dict(request_id='a',sequence_index=0,start=0,stop=2,computed_tokens=0,prompt_length=2)]
+    assert r['validation_seconds']>=0 and r['serialization_seconds']>=0

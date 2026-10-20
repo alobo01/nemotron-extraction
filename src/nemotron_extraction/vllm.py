@@ -20,8 +20,11 @@ class VLLMExtractor:
                  sequences_per_call=4, dtype="bfloat16", trust_remote_code=True,
                  tensor_parallel_size=1, enforce_eager=True, enable_prefix_caching=False,
                  enable_chunked_prefill=False, sink_dir=None, gpu_memory_utilization=0.96,
-                 kv_cache_memory_bytes=None):
+                 kv_cache_memory_bytes=None, diagnostics=False, publication_threads=1):
         self.sites = validate_sites(sites)
+        if type(publication_threads) is not int or publication_threads not in (1, 2):
+            raise ValueError("publication_threads must be 1 or 2")
+        self.diagnostics, self.publication_threads = diagnostics, publication_threads
         if tensor_parallel_size != 1 or not enforce_eager or enable_prefix_caching:
             raise ValueError("Requires TP=1, eager=True and prefix caching=False")
         if sequences_per_call < 1 or max_model_len < 2 or not 0 < gpu_memory_utilization <= 1:
@@ -37,6 +40,7 @@ class VLLMExtractor:
         self.generate_seconds = self.worker_forward_seconds = 0.0
         self.worker_collection_seconds = self.driver_read_seconds = 0.0
         self.worker_copy_seconds = self.worker_write_seconds = 0.0
+        self.validation_seconds = self.serialization_seconds = self.worker_rpc_seconds = 0.0
         self.backpressure_seconds = self.final_drain_seconds = 0.0
         self.peak_gpu_memory_bytes = self.peak_gpu_reserved_bytes = self.peak_device_memory_bytes = 0
         self.total_device_memory_bytes = 0
@@ -77,7 +81,8 @@ class VLLMExtractor:
         self.params = SamplingParams(max_tokens=1, temperature=0)
         started = time.perf_counter()
         self.topology = (await self.llm.collective_rpc(
-            "nh_install", args=([asdict(s) for s in self.sites], self.sink.name)))[0]
+            "nh_install", args=([asdict(s) for s in self.sites], self.sink.name,
+                                self.diagnostics, self.publication_threads)))[0]
         self.hook_install_seconds = time.perf_counter() - started
         self.installed = True
 
@@ -85,10 +90,13 @@ class VLLMExtractor:
         started = time.perf_counter()
         ready = (await self.llm.collective_rpc("nh_poll"))[0]
         self.worker_collection_seconds += time.perf_counter() - started
+        self.worker_rpc_seconds += time.perf_counter() - started
         for receipt in ready:
             self.topology = receipt["topology"]
             self.worker_copy_seconds += receipt["worker_copy_seconds"]
             self.worker_write_seconds += receipt["write_seconds"]
+            self.validation_seconds += receipt["validation_seconds"]
+            self.serialization_seconds += receipt["serialization_seconds"]
             self.worker_forward_seconds += receipt["worker_forward_seconds"]
             self.actual_forward_batches.extend(receipt["actual_forward_batches"])
             for name in ("peak_gpu_memory_bytes", "peak_gpu_reserved_bytes", "peak_device_memory_bytes",
@@ -156,15 +164,19 @@ class VLLMExtractor:
                         raise FileExistsError(path)
                     wave_id = f"{namespace}-{index}"
                     ids = [f"{wave_id}-{row}" for row in range(len(chunk))]
+                    rpc_started = time.perf_counter()
                     admitted = (await self.llm.collective_rpc(
                         "nh_begin", args=(wave_id, ids, chunk.tolist(), str(path.resolve()))))[0]
+                    self.worker_rpc_seconds += time.perf_counter() - rpc_started
                     if not admitted:
                         raise RuntimeError("Capture admission violated the two-slot bound")
                     pending[wave_id] = index
                     started = time.perf_counter()
                     await self._generate(chunk, ids)
                     self.generate_seconds += time.perf_counter() - started
+                    rpc_started = time.perf_counter()
                     await self.llm.collective_rpc("nh_seal", args=(wave_id,))
+                    self.worker_rpc_seconds += time.perf_counter() - rpc_started
                     index += 1
             started = time.perf_counter()
             while pending:

@@ -76,7 +76,7 @@ class SiblingWorker:
         self.cmp_source = source
         self.cmp_worker = source["ActivationHookExtension"]()
         self.cmp_worker.model_runner = self.model_runner
-        self.cmp_events, self.cmp_batches = [], []
+        self.cmp_events, self.cmp_batches, self.cmp_scheduler = [], [], []
         model = self.model_runner.model
         self.cmp_handles = [model.register_forward_pre_hook(self._cmp_start, with_kwargs=True)]
         specs = [(s["key"], s["kind"], s["layer"]) for s in sites]
@@ -97,6 +97,18 @@ class SiblingWorker:
         runner = self.model_runner
         counts = runner.input_batch.num_computed_tokens_cpu[:len(runner.input_batch.req_ids)]
         self.cmp_batches.append(sum(int(n) == 0 for n in counts))
+        starts = runner.query_start_loc.cpu[:len(counts)+1].tolist()
+        for i, rid in enumerate(runner.input_batch.req_ids):
+            computed = int(counts[i])
+            if computed >= self.cmp_prompt_length:
+                continue
+            if computed != 0 or starts[i+1]-starts[i] != self.cmp_prompt_length:
+                raise RuntimeError('Sibling comparison requires whole-prefill prompts')
+            self.cmp_scheduler.append(dict(request_id=rid, start=int(starts[i]), stop=int(starts[i+1]),
+                computed_tokens=computed, prompt_length=self.cmp_prompt_length))
+
+    def cmp_expect(self, prompt_length):
+        self.cmp_prompt_length = prompt_length
 
     def _cmp_stop(self, module, args, output):
         stop = torch.cuda.Event(enable_timing=True)
@@ -117,11 +129,13 @@ class SiblingWorker:
         free, total = torch.cuda.mem_get_info()
         result = dict(forward_seconds=sum(a.elapsed_time(b) / 1000 for a, b in self.cmp_events),
                       actual_forward_batches=list(self.cmp_batches),
+                      scheduler=list(self.cmp_scheduler),
                       peak_allocated_bytes=torch.cuda.max_memory_allocated(),
                       peak_reserved_bytes=torch.cuda.max_memory_reserved(), device_used_bytes=total-free)
         if reset:
             self.cmp_events.clear()
             self.cmp_batches.clear()
+            self.cmp_scheduler.clear()
             torch.cuda.reset_peak_memory_stats()
         return result
 
@@ -171,6 +185,7 @@ class SiblingExtractor:
     async def stream_to_disk(self, token_batches, output_dir):
         receipts = []
         for index, tokens in enumerate(token_batches):
+            self.rpc('cmp_expect', tokens.shape[1])
             started = time.perf_counter()
             self.llm.generate([{"prompt_token_ids": row.tolist()} for row in tokens],
                               self.params, use_tqdm=False)
@@ -263,6 +278,7 @@ def phase(extractor, token_batches, output):
     before = {name: getattr(extractor, name, 0.) for name in (
         "model_forward_seconds", "worker_forward_seconds", "cpu_copy_seconds", "worker_copy_seconds",
         "worker_write_seconds", "generate_seconds", "driver_read_seconds", "backpressure_seconds",
+        "worker_rpc_seconds",
         "final_drain_seconds", "copy_seconds", "write_seconds")}
     if isinstance(extractor, SiblingExtractor):
         extractor.rpc("cmp_stats", True)

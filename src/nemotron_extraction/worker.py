@@ -29,13 +29,17 @@ def assemble_rows(steps, token_ids, keys):
 
 
 class ActivationHookExtension:
-    def nh_install(self, sites, sink_dir):
+    def nh_install(self, sites, sink_dir, diagnostics=False, publication_threads=1):
+        if type(publication_threads) is not int or publication_threads not in (1, 2):
+            raise ValueError("publication_threads must be 1 or 2")
+        self.nh_diagnostics = diagnostics
         self.nh_captured = {}
+        self.nh_capture_events = []
         self.nh_pool = BufferPool()
         self.nh_active = None
         self.nh_pending = {}
         self.nh_copy = ThreadPoolExecutor(max_workers=1)
-        self.nh_writer = ThreadPoolExecutor(max_workers=1)
+        self.nh_writer = ThreadPoolExecutor(max_workers=publication_threads)
         self.nh_stream = torch.cuda.Stream()
         self.nh_origin = torch.cuda.Event(enable_timing=True)
         self.nh_origin.record()
@@ -45,7 +49,8 @@ class ActivationHookExtension:
         self.nh_keys = [site.key for site in specs]
         model = self.model_runner.model
         try:
-            self.nh_handles, self.nh_topology = install(model, specs, self.nh_captured, worker=True)
+            self.nh_handles, self.nh_topology = install(model, specs, self.nh_captured, worker=True,
+                capture_events=self.nh_capture_events if diagnostics else None)
             self.nh_handles.extend([
                 model.register_forward_pre_hook(self._nh_inputs, with_kwargs=True),
                 model.register_forward_hook(self._nh_end),
@@ -72,6 +77,8 @@ class ActivationHookExtension:
                           "path": path, "tensors": {"token_ids": tokens}, "copies": [],
                           "covered": set(), "forward_events": [], "forward_batches": [],
                           "copy_events": [], "origin": self.nh_origin,
+                          "scheduler": [], "diagnostics": self.nh_diagnostics,
+                          "capture_events": [],
                           "origin_cpu": self.nh_origin_cpu,
                           "device_peak": 0, "device_total": 0, "reserved_peak": 0}
         return True
@@ -103,10 +110,12 @@ class ActivationHookExtension:
                 raise RuntimeError("Requires whole-prefill prompts; partial prefill is unsupported")
             if prompt_index in wave["covered"]:
                 raise RuntimeError("Prompt captured twice")
-            actual = batch.token_ids_cpu[index, :length].tolist()
-            if actual != wave["tokens"][prompt_index].tolist():
+            if self.nh_diagnostics and not torch.equal(
+                    batch.token_ids_cpu[index, :length], wave["tokens"][prompt_index]):
                 raise RuntimeError("Worker input token IDs differ from submitted prompt")
             spans.append((prompt_index, start, end))
+            wave["scheduler"].append(dict(request_id=rid, sequence_index=prompt_index,
+                start=start, stop=end, computed_tokens=computed, prompt_length=length))
             wave["covered"].add(prompt_index)
         self.nh_spans = spans
         self.nh_forward_start = torch.cuda.Event(enable_timing=True)
@@ -120,6 +129,10 @@ class ActivationHookExtension:
         wave["forward_batches"].append(len(self.nh_spans))
         captured = dict(self.nh_captured)
         self.nh_captured.clear()
+        wave["capture_events"].extend(self.nh_capture_events)
+        self.nh_capture_events.clear()
+        if set(captured) != set(self.nh_keys):
+            raise RuntimeError("Captured site set differs from requested sites")
         stream = torch.cuda.current_stream()
         started, ended = (torch.cuda.Event(enable_timing=True) for _ in range(2))
         total_rows = wave["tokens"].numel()
@@ -128,6 +141,8 @@ class ActivationHookExtension:
             self.nh_stream.wait_stream(stream)
             started.record()
             for key, source in captured.items():
+                if source.ndim != 2 or any(stop > source.shape[0] for _, _, stop in self.nh_spans):
+                    raise RuntimeError(f"{key}: capture shape does not cover scheduler spans")
                 host = self.nh_pool.tensor(wave["slot"], key, (total_rows, source.shape[-1]),
                                            source.dtype, pinned=True)
                 wave["tensors"][key] = host
@@ -138,6 +153,11 @@ class ActivationHookExtension:
             ended.record()
         wave["copies"].append(self.nh_copy.submit(finish_copy, ended, started, ended, captured))
         wave["copy_events"].append((started, ended))
+        if self.nh_diagnostics:
+            self._nh_memory(wave)
+
+    @staticmethod
+    def _nh_memory(wave):
         free, total = torch.cuda.mem_get_info()
         wave["device_peak"] = max(wave["device_peak"], total - free)
         wave["device_total"] = max(wave["device_total"], total)
@@ -149,6 +169,7 @@ class ActivationHookExtension:
             raise RuntimeError("Unknown capture wave")
         if len(wave["covered"]) != len(wave["tokens"]):
             raise RuntimeError("Missing prompt activations")
+        self._nh_memory(wave)
         wave["allocated_peak"] = torch.cuda.max_memory_allocated()
         wave["topology"] = {key: dict(value) for key, value in self.nh_topology.items()}
         self.nh_pending[wave_id] = (wave["slot"], self.nh_writer.submit(self._nh_publish, wave))
@@ -162,8 +183,11 @@ class ActivationHookExtension:
         write_start = time.perf_counter() - wave["origin_cpu"]
         receipt = publish(wave["tensors"], wave["path"], {"wave_id": wave["id"]})
         receipt.update(wave_id=wave["id"], tokens=wave["tokens"].numel(),
+                       capture_seconds=(sum(a.elapsed_time(b)/1000 for _,a,b in wave["capture_events"])
+                                        if wave["diagnostics"] else None),
                        worker_copy_seconds=copy_seconds, worker_forward_seconds=forward_seconds,
                        actual_forward_batches=wave["forward_batches"], topology=wave["topology"],
+                       scheduler=wave["scheduler"], diagnostics=wave["diagnostics"],
                        peak_gpu_memory_bytes=wave["allocated_peak"],
                        peak_gpu_reserved_bytes=wave["reserved_peak"],
                        peak_device_memory_bytes=wave["device_peak"],
@@ -204,3 +228,8 @@ class ActivationHookExtension:
             self.nh_captured.clear()
             self.nh_active = None
             self.nh_pending.clear()
+            # Transfers and writers have drained; no slot can still be read.
+            with self.nh_pool.lock:
+                self.nh_pool.free = [0, 1]
+                for slot in self.nh_pool.slots:
+                    slot.clear()
