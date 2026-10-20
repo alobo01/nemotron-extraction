@@ -9,7 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 import torch
 from safetensors.torch import load_file
-from .types import ActivationBatch, validate_sites, validate_tokens
+from .types import ActivationBatch, validate_publication_threads, validate_sites, validate_tokens
 
 
 class VLLMExtractor:
@@ -22,9 +22,8 @@ class VLLMExtractor:
                  enable_chunked_prefill=False, sink_dir=None, gpu_memory_utilization=0.96,
                  kv_cache_memory_bytes=None, diagnostics=False, publication_threads=1):
         self.sites = validate_sites(sites)
-        if type(publication_threads) is not int or publication_threads not in (1, 2):
-            raise ValueError("publication_threads must be 1 or 2")
-        self.diagnostics, self.publication_threads = diagnostics, publication_threads
+        self.diagnostics = diagnostics
+        self.publication_threads = validate_publication_threads(publication_threads)
         if tensor_parallel_size != 1 or not enforce_eager or enable_prefix_caching:
             raise ValueError("Requires TP=1, eager=True and prefix caching=False")
         if sequences_per_call < 1 or max_model_len < 2 or not 0 < gpu_memory_utilization <= 1:

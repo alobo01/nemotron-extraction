@@ -27,6 +27,11 @@ def validate_sites(sites: Iterable[HookSite]) -> tuple[HookSite, ...]:
         raise ValueError("Provide at least one site, without duplicates")
     return result
 
+def validate_publication_threads(threads: int) -> int:
+    if type(threads) is not int or threads not in (1, 2):
+        raise ValueError("publication_threads must be 1 or 2")
+    return threads
+
 def validate_tokens(token_ids: torch.Tensor) -> torch.Tensor:
     if token_ids.dtype != torch.long or token_ids.ndim != 2 or not all(token_ids.shape):
         raise ValueError("token_ids must be a nonempty rectangular int64 [batch, length] tensor")

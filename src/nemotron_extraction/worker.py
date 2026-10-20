@@ -6,7 +6,7 @@ import time
 import torch
 from .hooks import install
 from .transport import BufferPool, finish_copy, publish
-from .types import HookSite
+from .types import HookSite, validate_publication_threads
 
 
 def assemble_rows(steps, token_ids, keys):
@@ -30,8 +30,7 @@ def assemble_rows(steps, token_ids, keys):
 
 class ActivationHookExtension:
     def nh_install(self, sites, sink_dir, diagnostics=False, publication_threads=1):
-        if type(publication_threads) is not int or publication_threads not in (1, 2):
-            raise ValueError("publication_threads must be 1 or 2")
+        validate_publication_threads(publication_threads)
         self.nh_diagnostics = diagnostics
         self.nh_captured = {}
         self.nh_capture_events = []

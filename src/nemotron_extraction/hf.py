@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from .hooks import install
 from .transport import BufferPool, finish_copy, publish
-from .types import ActivationBatch, validate_sites, validate_tokens
+from .types import ActivationBatch, validate_publication_threads, validate_sites, validate_tokens
 
 
 def _cuda_device_index(device: torch.device) -> int:
@@ -23,9 +23,8 @@ class HFExtractor:
     def __init__(self, model, sites, *, revision=None, device="cuda", dtype=torch.bfloat16,
                  trust_remote_code=True, local_files_only=False, gpu_memory_utilization=0.96,
                  diagnostics=False, publication_threads=1):
-        if type(publication_threads) is not int or publication_threads not in (1, 2):
-            raise ValueError("publication_threads must be 1 or 2")
-        self.diagnostics, self.publication_threads = diagnostics, publication_threads
+        self.diagnostics = diagnostics
+        self.publication_threads = validate_publication_threads(publication_threads)
         self.sites = validate_sites(sites)
         self.closed = False
         self.owns_model = not isinstance(model, nn.Module)
