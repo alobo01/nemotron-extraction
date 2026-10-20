@@ -5,3 +5,4 @@ recursive-include benchmarks *.py
 prune outputs
 prune internal_docs
 include benchmarks/README.md
+recursive-include tests *.py
