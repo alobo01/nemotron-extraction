@@ -1,4 +1,4 @@
-"""Verify installed worker discovery and engine interfaces outside the checkout."""
+"""Check that the installed vLLM still exposes the engine and runner internals the worker relies on."""
 import importlib.metadata
 import inspect
 from pathlib import Path

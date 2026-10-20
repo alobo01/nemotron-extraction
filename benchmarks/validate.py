@@ -2,17 +2,19 @@
 # requires-python = ">=3.10"
 # dependencies = ["nemotron-extraction[hf,vllm,benchmark]==1.1.0"]
 # ///
-"""Single-file benchmark: prepare frozen inputs and compare both backends.
+"""Compare both backends on frozen FineWeb inputs for English, German and Spanish.
 
 uv run benchmarks/validate.py all --work outputs/tokens --output outputs/validation
+
+When one job cannot finish a language, run a pilot with `run --tokens 16384` into
+<pilot>/<lang>-0, split the full run with `plan --pilot <pilot>`, run each range with
+`run --start/--tokens`, and join the ranges with `aggregate`.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.metadata
 import json
-import math
 import os
 from pathlib import Path
 import subprocess
@@ -22,34 +24,14 @@ import time
 import torch
 from safetensors.torch import load_file, save_file
 from nemotron_extraction import HFExtractor, VLLMExtractor, HookSite
-from benchlib.common import digest as sha256, write_json
 from nemotron_extraction.hooks import representative_sites
 
-MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
-MODEL_REVISION = "fe4143e388795a58a92974891b2e45092a53dc1d"
-DATA = {"en": ("HuggingFaceFW/fineweb-edu", "sample-10BT"),
-        "de": ("HuggingFaceFW/fineweb-2", "deu_Latn"),
-        "es": ("HuggingFaceFW/fineweb-2", "spa_Latn")}
+from benchlib.common import (DATA, MODEL, MODEL_REVISION, batches, digest as sha256, job_minutes,
+                             load_tokens, versions, write_json)
+from benchlib.stats import Agreement, normalized_mse
 
-
-def versions():
-    result = {"python": sys.version.split()[0], "cuda": torch.version.cuda}
-    for name in ("nemotron-extraction", "torch", "transformers", "vllm", "datasets", "safetensors",
-                 "mamba-ssm", "causal-conv1d", "accelerate", "kernels"):
-        try:
-            result[name] = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
-            result[name] = None
-    return result
-
-
-def batches(tokens, batch_size, seq_len):
-    full = tokens.numel() // seq_len * seq_len
-    if full:
-        for chunk in tokens[:full].reshape(-1, seq_len).split(batch_size):
-            yield chunk
-    if full < tokens.numel():
-        yield tokens[full:].unsqueeze(0)
+TOKENS_PER_LANGUAGE = 1_000_000
+BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128)
 
 
 def prepare(args):
@@ -66,7 +48,7 @@ def prepare(args):
     if tokenizer.eos_token_id is None:
         raise ValueError("An EOS token is required for document boundaries")
     manifest = {"model": MODEL, "model_revision": revision, "model_path": model,
-                "tokenizer_revision": revision, "sequence_length": 2048, "tokens_per_language": 1_000_000,
+                "tokenizer_revision": revision, "sequence_length": 2048, "tokens_per_language": TOKENS_PER_LANGUAGE,
                 "dtype": "bfloat16", "seed": 42, "document_order": "dataset iteration order; no shuffle",
                 "languages": {}, "software": versions()}
     for language, (dataset, config) in DATA.items():
@@ -80,12 +62,12 @@ def prepare(args):
             tokens.extend(encoded + [tokenizer.eos_token_id])
             order.update((str(row.get("id", "")) + "\0" + row["text"]).encode())
             documents += 1
-            if len(tokens) >= 1_000_000:
+            if len(tokens) >= TOKENS_PER_LANGUAGE:
                 break
-        if len(tokens) < 1_000_000:
+        if len(tokens) < TOKENS_PER_LANGUAGE:
             raise ValueError(f"Insufficient {language} tokens")
         path = root / f"{language}.safetensors"
-        save_file({"token_ids": torch.tensor(tokens[:1_000_000], dtype=torch.long)}, str(path))
+        save_file({"token_ids": torch.tensor(tokens[:TOKENS_PER_LANGUAGE], dtype=torch.long)}, str(path))
         manifest["languages"][language] = {"dataset": dataset, "config": config, "revision": data_revision,
                                            "split": "train", "documents": documents,
                                            "document_order_sha256": order.hexdigest(), "token_sha256": sha256(path)}
@@ -93,62 +75,11 @@ def prepare(args):
     write_json(root / "manifest.json", manifest)
 
 
-def normalized_mse(error_squared_sum, reference_squared_sum):
-    """MSE after scaling both tensors by the reference's site-wide RMS.
-
-    The shared scale preserves magnitude errors. A zero reference has no
-    usable scale: return zero for identical zeros and None otherwise.
-    """
-    if reference_squared_sum:
-        return error_squared_sum / reference_squared_sum
-    return 0. if not error_squared_sum else None
-
-
-class Agreement:
-    """FP32 differences and norms, accumulated in float64; exact cosine quantiles."""
-    def __init__(self):
-        self.cosines, self.error2, self.reference2, self.max_error = [], 0., 0., 0.
-
-    def add(self, reference, candidate):
-        if reference.shape != candidate.shape or reference.dtype != candidate.dtype:
-            raise ValueError("Activation shapes or dtypes differ")
-        for left, right in zip(reference.split(256), candidate.split(256)):
-            left, right = left.float(), right.float()
-            if not bool(torch.isfinite(left).all() and torch.isfinite(right).all()):
-                raise ValueError("Nonfinite activations")
-            diff = right - left
-            self.error2 += float(diff.double().square().sum())
-            self.reference2 += float(left.double().square().sum())
-            self.max_error = max(self.max_error, float(diff.abs().max()))
-            a, b = left.norm(dim=-1), right.norm(dim=-1)
-            denominator = a * b
-            cosine = (left * right).sum(-1) / denominator.clamp_min(torch.finfo(torch.float32).tiny)
-            cosine[(a == 0) & (b == 0)] = 1.
-            self.cosines.append(cosine.clamp(-1, 1))
-
-    def result(self):
-        cosine = torch.cat(self.cosines)
-        # A zero reference has relative error zero only when the candidate is also zero.
-        nmse = normalized_mse(self.error2, self.reference2)
-        relative = math.sqrt(nmse) if nmse is not None else None
-        result = {"tokens": len(cosine), "mean_cosine": float(cosine.mean()),
-                  "minimum_cosine": float(cosine.min()), "first_percentile_cosine": float(cosine.quantile(.01)),
-                  "relative_l2": relative, "normalized_mse": nmse,
-                  "mse_normalization": "shared_hf_rms_per_site",
-                  "maximum_absolute_error": self.max_error,
-                  "error_squared_sum": self.error2, "reference_squared_sum": self.reference2}
-        result["passed"] = result["mean_cosine"] >= .9999 and result["minimum_cosine"] >= .9990 and relative is not None and relative <= .02
-        return result
-
-
 def backend(args):
     torch.set_num_threads(min(16, os.cpu_count() or 1))
     manifest = json.loads((args.work / "manifest.json").read_text())
     data = manifest["languages"][args.language]
-    path = args.work / f"{args.language}.safetensors"
-    if sha256(path) != data["token_sha256"]:
-        raise ValueError("Frozen token file checksum mismatch")
-    all_tokens = load_file(str(path))["token_ids"]
+    all_tokens = load_tokens(args.work, args.language, manifest)
     stop = min(args.start + args.tokens, all_tokens.numel())
     if args.start < 0 or args.start % 2048 or args.start >= stop or stop - args.start != args.tokens:
         raise ValueError("Invalid token range")
@@ -313,13 +244,13 @@ def run_all(args):
     for language in DATA:
         output = args.output / language
         run_args = argparse.Namespace(
-            work=args.work, output=output, language=language, tokens=1_000_000,
+            work=args.work, output=output, language=language, tokens=TOKENS_PER_LANGUAGE,
             start=0, batch_size=args.batch_size, hf_python=args.hf_python,
         )
         if (output / "hf.json").exists() and (output / "vllm.json").exists():
             for engine in ("hf", "vllm"):
                 receipt = json.loads((output / f"{engine}.json").read_text())
-                expected = {"language": language, "tokens": 1_000_000, "start_token": 0,
+                expected = {"language": language, "tokens": TOKENS_PER_LANGUAGE, "start_token": 0,
                             "batch_size": args.batch_size,
                             "manifest_sha256": sha256(args.work / "manifest.json")}
                 if any(receipt.get(key) != value for key, value in expected.items()):
@@ -327,6 +258,84 @@ def run_all(args):
             report(run_args)
         else:
             run(run_args)
+
+
+def plan_ranges(pilot, batch_size):
+    """Split each language into contiguous ranges that fit one-hour jobs, from pilot receipts."""
+    jobs = []
+    records = {}
+    for language in ("en", "de", "es"):
+        path = pilot / f"{language}-0"
+        hf = json.loads((path / "hf.json").read_text())
+        vllm = json.loads((path / "vllm.json").read_text())
+        if hf["tokens"] != 16384 or vllm["tokens"] != 16384:
+            raise ValueError("Need complete 16,384-token pilot receipts")
+        if hf["batch_size"] != batch_size or vllm["batch_size"] != batch_size:
+            raise ValueError("Both pilot backends must use the selected batch size")
+        records[language] = (hf, vllm)
+    # A new allocation can have cold weights even if later pilot languages were warm.
+    startup = max(pair[0]["startup_seconds"] for pair in records.values())
+    startup += max(pair[1]["startup_seconds"] for pair in records.values())
+    for language, (hf, vllm) in records.items():
+        # Wall minus startup includes warmup, cleanup, persistence and comparison.
+        fixed = max(0, hf["wall_seconds"] - hf["startup_seconds"] - hf["extraction_seconds"] - hf["persistence_seconds"])
+        fixed += max(0, vllm["wall_seconds"] - vllm["startup_seconds"] - vllm["extraction_seconds"] - vllm["comparison_seconds"])
+        per_token = (hf["extraction_seconds"] + hf["persistence_seconds"] +
+                     vllm["extraction_seconds"] + vllm["comparison_seconds"]) / 16384
+        available = (3600 - 120) / 1.25 - startup - fixed
+        maximum = int(available / per_token / 2048) * 2048
+        if maximum < 2048:
+            raise ValueError("Model startup leaves no useful work in a one-hour job")
+        start = 0
+        while start < TOKENS_PER_LANGUAGE:
+            count = min(maximum, TOKENS_PER_LANGUAGE - start)
+            minutes = job_minutes(startup + fixed + count * per_token)
+            jobs.append({"language": language, "start": start, "tokens": count,
+                         "minutes": min(60, minutes), "batch_size": batch_size})
+            start += count
+    return jobs
+
+
+def aggregate_ranges(paths, output, expected=TOKENS_PER_LANGUAGE):
+    """Join contiguous range receipts into one language receipt and report."""
+    receipts = []
+    for path in paths:
+        hf = json.loads((path / "hf.json").read_text())
+        vllm = json.loads((path / "vllm.json").read_text())
+        report(argparse.Namespace(output=path))
+        receipts.append((hf["start_token"], path, hf, vllm))
+    receipts.sort()
+    first = receipts[0]
+    end = 0
+    combined = {}
+    for start, path, hf, vllm in receipts:
+        if start != end:
+            raise ValueError("Ranges must be contiguous, non-overlapping and begin at zero")
+        for engine, record, baseline in (("hf", hf, first[2]), ("vllm", vllm, first[3])):
+            for key in ("language", "manifest_sha256", "batch_size", "sequence_length", "topology", "software", "script_sha256", "source", "gpu", "gpu_memory_utilization", "kv_cache_memory_bytes", "cuda_graphs_enabled"):
+                if record[key] != baseline[key]:
+                    raise ValueError(f"Ranges disagree on {engine} {key}")
+        end += hf["tokens"]
+        cosines = load_file(str(path / "cosines.safetensors"))
+        for key, metric in vllm["agreement"].items():
+            if cosines[key].numel() != hf["tokens"]:
+                raise ValueError("Cosine rows do not match counted tokens")
+            combined.setdefault(key, Agreement()).merge_result(metric, cosines[key])
+    if end != expected:
+        raise ValueError(f"Expected exactly {expected:,} tokens, got {end:,}")
+    output.mkdir(parents=True, exist_ok=True)
+    for engine, column in (("hf", 2), ("vllm", 3)):
+        result = dict(first[column])
+        result.update(tokens=end, start_token=0, ranges=len(receipts))
+        for key in ("model_load_seconds", "hook_install_seconds", "startup_seconds", "warmup_seconds", "inference_seconds", "capture_copy_seconds", "driver_read_seconds", "extraction_seconds", "comparison_seconds", "persistence_seconds", "wall_seconds"):
+            result[key] = sum(row[column][key] for row in receipts)
+        result["tokens_per_second"] = end / result["extraction_seconds"]
+        result["peak_gpu_memory_bytes"] = max(row[column]["peak_gpu_memory_bytes"] for row in receipts)
+        if engine == "vllm":
+            result["agreement"] = {key: value.result() for key, value in combined.items()}
+            result["passed"] = all(value["passed"] for value in result["agreement"].values())
+        write_json(output / f"{engine}.json", result)
+    report(argparse.Namespace(output=output))
 
 
 def main():
@@ -339,7 +348,7 @@ def main():
     complete.add_argument("--work", type=Path, default=Path("outputs/tokens"))
     complete.add_argument("--output", type=Path, default=Path("outputs/validation"))
     complete.add_argument("--revision", default=MODEL_REVISION)
-    complete.add_argument("--batch-size", type=int, choices=(1, 2, 4, 8, 16, 32, 64, 128), default=4)
+    complete.add_argument("--batch-size", type=int, choices=BATCH_SIZES, default=4)
     complete.add_argument("--hf-python", help="Compatible Hugging Face Transformers Python, if separate")
     for command in ("run", "backend", "report"):
         child = sub.add_parser(command)
@@ -348,15 +357,26 @@ def main():
             continue
         child.add_argument("--work", type=Path, required=True)
         child.add_argument("--language", choices=DATA, required=True)
-        child.add_argument("--tokens", type=int, default=1_000_000)
+        child.add_argument("--tokens", type=int, default=TOKENS_PER_LANGUAGE)
         child.add_argument("--start", type=int, default=0)
-        child.add_argument("--batch-size", type=int, choices=(1, 2, 4, 8, 16, 32, 64, 128), default=4)
+        child.add_argument("--batch-size", type=int, choices=BATCH_SIZES, default=4)
         if command == "backend":
             child.add_argument("--backend", choices=("hf", "vllm"), required=True)
         else:
             child.add_argument("--hf-python", help="Existing compatible HF environment, if different from vLLM")
+    planning = sub.add_parser("plan", help="Print job ranges from <pilot>/<lang>-0 receipts; submits nothing")
+    planning.add_argument("--pilot", type=Path, required=True)
+    planning.add_argument("--batch-size", type=int, choices=BATCH_SIZES, default=4)
+    joining = sub.add_parser("aggregate", help="Join contiguous range receipts for one language")
+    joining.add_argument("--ranges", nargs="+", type=Path, required=True)
+    joining.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    {"prepare": prepare, "backend": backend, "run": run, "report": report, "all": run_all}[args.command](args)
+    if args.command == "plan":
+        print(json.dumps(plan_ranges(args.pilot, args.batch_size), indent=2))
+    elif args.command == "aggregate":
+        aggregate_ranges(args.ranges, args.output)
+    else:
+        {"prepare": prepare, "backend": backend, "run": run, "report": report, "all": run_all}[args.command](args)
 
 
 if __name__ == "__main__":

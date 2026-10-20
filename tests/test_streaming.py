@@ -6,7 +6,7 @@ import torch
 from safetensors.torch import load_file
 from nemotron_extraction import HFExtractor, HookSite
 from nemotron_extraction.transport import BufferPool, publish
-from test_hooks import Model
+from tiny_models import Model
 
 
 def test_two_slots_are_reused_only_after_release():

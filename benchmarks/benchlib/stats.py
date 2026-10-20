@@ -1,10 +1,66 @@
-"""Exact per-row agreement statistics between two activation tensors."""
+"""Agreement statistics between reference and candidate activations."""
 from __future__ import annotations
 
 import json
+import math
 
 import torch
 from safetensors.torch import save_file
+
+
+def normalized_mse(error_squared_sum, reference_squared_sum):
+    """MSE after scaling both tensors by the reference's site-wide RMS.
+
+    The shared scale preserves magnitude errors. A zero reference has no
+    usable scale: return zero for identical zeros and None otherwise.
+    """
+    if reference_squared_sum:
+        return error_squared_sum / reference_squared_sum
+    return 0. if not error_squared_sum else None
+
+
+class Agreement:
+    """FP32 differences and norms, accumulated in float64; exact cosine quantiles."""
+    def __init__(self):
+        self.cosines, self.error2, self.reference2, self.max_error = [], 0., 0., 0.
+
+    def add(self, reference, candidate):
+        if reference.shape != candidate.shape or reference.dtype != candidate.dtype:
+            raise ValueError("Activation shapes or dtypes differ")
+        for left, right in zip(reference.split(256), candidate.split(256)):
+            left, right = left.float(), right.float()
+            if not bool(torch.isfinite(left).all() and torch.isfinite(right).all()):
+                raise ValueError("Nonfinite activations")
+            diff = right - left
+            self.error2 += float(diff.double().square().sum())
+            self.reference2 += float(left.double().square().sum())
+            self.max_error = max(self.max_error, float(diff.abs().max()))
+            a, b = left.norm(dim=-1), right.norm(dim=-1)
+            denominator = a * b
+            cosine = (left * right).sum(-1) / denominator.clamp_min(torch.finfo(torch.float32).tiny)
+            cosine[(a == 0) & (b == 0)] = 1.
+            self.cosines.append(cosine.clamp(-1, 1))
+
+    def merge_result(self, result, cosines):
+        """Fold in a saved ``result()`` and its per-row cosines, e.g. from another token range."""
+        self.cosines.append(cosines)
+        self.error2 += result["error_squared_sum"]
+        self.reference2 += result["reference_squared_sum"]
+        self.max_error = max(self.max_error, result["maximum_absolute_error"])
+
+    def result(self):
+        cosine = torch.cat(self.cosines)
+        # A zero reference has relative error zero only when the candidate is also zero.
+        nmse = normalized_mse(self.error2, self.reference2)
+        relative = math.sqrt(nmse) if nmse is not None else None
+        result = {"tokens": len(cosine), "mean_cosine": float(cosine.mean()),
+                  "minimum_cosine": float(cosine.min()), "first_percentile_cosine": float(cosine.quantile(.01)),
+                  "relative_l2": relative, "normalized_mse": nmse,
+                  "mse_normalization": "shared_hf_rms_per_site",
+                  "maximum_absolute_error": self.max_error,
+                  "error_squared_sum": self.error2, "reference_squared_sum": self.reference2}
+        result["passed"] = result["mean_cosine"] >= .9999 and result["minimum_cosine"] >= .9990 and relative is not None and relative <= .02
+        return result
 
 
 def same_expert_sets(left, right):

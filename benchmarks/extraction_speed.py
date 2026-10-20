@@ -2,10 +2,11 @@
 # requires-python = ">=3.10"
 # dependencies = ["nemotron-extraction[hf,vllm,benchmark]==1.1.0"]
 # ///
-"""Focused extraction benchmark. Install the selected frozen wheel with uv first.
+"""Extraction throughput of this package against Transformers and the nemotron-sae methods.
 
-Run each method/batch in its own process, sequentially. Comparison is a separate
-CPU stage; detailed profiling is a separate run. No training or cluster settings.
+Run each method and batch size in its own process, one after another, then `compare`.
+Profiling (`--profile`) is a separate run. Optional environment settings:
+NH_KV_CACHE_BYTES, NH_ENABLE_CHUNKED_PREFILL, NH_RUN_STORAGE_LIMIT_BYTES.
 """
 from __future__ import annotations
 
@@ -22,17 +23,19 @@ import time
 import traceback
 
 import torch
-from safetensors import safe_open
 from safetensors.torch import save_file
 import nemotron_extraction
 from nemotron_extraction import HFExtractor, VLLMExtractor, HookSite
 from nemotron_extraction.hooks import representative_sites
+from nemotron_extraction.transport import MEMORY_KEYS
 from nemotron_extraction.worker import ActivationHookExtension
-from compare_repositories import (SiblingExtractor, configured_kv_cache_bytes, phase,
-    persist, sibling_namespace)
-from diagnose_divergence import inputs, REVISION
-from targeted_validation import Utilisation
-from validate import Agreement, sha256, versions, write_json
+
+from benchlib.common import (MODEL_REVISION, anchor_inputs, digest as sha256, is_memory_failure, package_hashes,
+                             versions, write_json)
+from benchlib.instrumentation import Utilisation
+from benchlib.sibling import (SiblingExtractor, configured_chunked_prefill, configured_kv_cache_bytes, measure,
+                              persist, read_site)
+from benchlib.stats import Agreement
 
 METHODS = ('transformers', 'package_baseline', 'package_optimized', 'sibling_files', 'sibling_fills')
 
@@ -87,7 +90,7 @@ def destination(args):
 
 def configuration(args):
     return dict(enforce_eager=True, tensor_parallel_size=1, enable_prefix_caching=False,
-        enable_chunked_prefill=True, max_model_len=2049, max_num_seqs=args.batch_size,
+        enable_chunked_prefill=configured_chunked_prefill(), max_model_len=2049, max_num_seqs=args.batch_size,
         max_num_batched_tokens=args.batch_size*2049, gpu_memory_utilization=.96,
         kv_cache_memory_bytes=configured_kv_cache_bytes())
 
@@ -103,7 +106,7 @@ def check_write_budget(root,additional_bytes):
 def run(args):
     torch.set_num_threads(4)
     torch.manual_seed(0)
-    manifest, rows = inputs(args.work)
+    manifest, rows = anchor_inputs(args.work)
     batches = workload(rows, args.batch_size)
     target = destination(args)
     target.mkdir(parents=True, exist_ok=True)
@@ -116,9 +119,9 @@ def run(args):
         raise FileExistsError('Preserve failed configuration; use a new output directory')
     record = dict(status='running', method=args.method, batch_size=args.batch_size,
         publication_threads=args.publication_threads, profile=args.profile, command=sys.argv,
-        model_revision=REVISION, token_sha256=manifest['languages']['en']['token_sha256'],
+        model_revision=MODEL_REVISION, token_sha256=manifest['languages']['en']['token_sha256'],
         imported_package=str(nemotron_extraction.__file__), software=versions(),
-        source_hashes={p.name:sha256(p) for p in sorted(Path(nemotron_extraction.__file__).parent.glob('*.py'))},
+        source_hashes=package_hashes(),
         sibling_hashes={p.name:sha256(p) for p in sorted(args.reference.glob('*.py'))},
         script_sha256=sha256(__file__), engine_configuration=configuration(args),
         gpu=torch.cuda.get_device_name(), repetitions=[],
@@ -147,7 +150,7 @@ def run(args):
                 sites = [HookSite(**s) for s in json.loads(sites_path.read_text())]
                 if args.method.startswith('package_'):
                     options = dict(sequences_per_call=args.batch_size, max_model_len=2049,
-                        enable_chunked_prefill=True, gpu_memory_utilization=.96,
+                        enable_chunked_prefill=configured_chunked_prefill(), gpu_memory_utilization=.96,
                         kv_cache_memory_bytes=configured_kv_cache_bytes(), sink_dir=str(target))
                     if args.method == 'package_optimized':
                         options.update(diagnostics=args.profile,publication_threads=args.publication_threads)
@@ -178,7 +181,7 @@ def run(args):
                 stage=target/f'rep-{repeat}'
                 payload=rows.numel()*(sum(s['width'] for s in extractor.topology.values())*2+8)
                 check_write_budget(args.output.parent,payload+10_000_000)
-                measurement=phase(extractor,batches if not args.profile else [batches[0],batches[0]],stage)
+                measurement=measure(extractor,batches if not args.profile else [batches[0],batches[0]],stage)
                 measurement.update(repetition=repeat,
                     validation_seconds=sum(r.get('validation_seconds',0.) for r in measurement['receipts']),
                     serialization_seconds=sum(r.get('serialization_seconds',0.) for r in measurement['receipts']),
@@ -191,9 +194,7 @@ def run(args):
                     if any(s['computed_tokens'] != 0 or s['stop']-s['start'] != 2048 for s in scheduler):
                         raise ValueError('Partial prefill in timing workload')
                 measurement['scheduler']=scheduler
-                measurement['memory_peaks']={name:getattr(extractor,name,None) for name in
-                    ('peak_gpu_memory_bytes','peak_gpu_reserved_bytes','peak_device_memory_bytes',
-                     'total_device_memory_bytes','peak_device_memory_fraction')}
+                measurement['memory_peaks']={name:getattr(extractor,name,None) for name in MEMORY_KEYS}
                 record['repetitions'].append(measurement)
                 write_json(stage/'receipt.json',measurement)
                 write_json(receipt_path,record)
@@ -219,10 +220,8 @@ def run(args):
                 prune_receipts(record['repetitions'][0],target)
             record['status']='complete'
     except Exception as error:
-        message=str(error)
-        record.update(status='memory_failure' if isinstance(error,torch.OutOfMemoryError) or
-            any(s in message.lower() for s in ('out of memory','no available memory','kv cache blocks')) else 'error',
-            error=message,traceback=traceback.format_exc(),failed_phase=current_phase)
+        record.update(status='memory_failure' if is_memory_failure(error) else 'error',
+            error=str(error),traceback=traceback.format_exc(),failed_phase=current_phase)
     finally:
         if extractor is not None:
             try: extractor.close()
@@ -232,24 +231,6 @@ def run(args):
     write_json(receipt_path,record)
     print(json.dumps({k:record.get(k) for k in ('status','method','batch_size','error','process_wall_seconds')}),flush=True)
     return 0 if record['status']=='complete' else 1
-
-
-def read_site(receipt,tokens,key,snapshot):
-    if receipt.get('mode') == 'sibling_files':
-        steps=[]
-        for path in receipt['paths']:
-            with safe_open(path,framework='pt',device='cpu') as f:
-                steps.append({k:f.get_tensor(k) for k in ('input_ids','positions',key)})
-        return sibling_namespace(snapshot)['assemble_rows'](steps,tokens,[key])[key]
-    if receipt.get('mode') == 'sibling_fills':
-        root=Path(receipt['path'])
-        with safe_open(root/'token_ids.safetensors',framework='pt',device='cpu') as f:
-            if not torch.equal(f.get_tensor('token_ids'),tokens): raise ValueError('Token attribution differs')
-        with safe_open(root/f'{key}.safetensors',framework='pt',device='cpu') as f:
-            return f.get_tensor('activations')
-    with safe_open(receipt['path'],framework='pt',device='cpu') as f:
-        if not torch.equal(f.get_tensor('token_ids'),tokens): raise ValueError('Token attribution differs')
-        return f.get_tensor(key)
 
 
 def compare_measurements(left,right,rows,sites,snapshot,output):
@@ -289,8 +270,6 @@ def compare_measurements(left,right,rows,sites,snapshot,output):
 
 
 def compare(args):
-    _,rows=inputs(args.work)
-    sites=[HookSite(**s) for s in json.loads((args.output/'sites.json').read_text())]
     records=[(p,json.loads(p.read_text())) for p in sorted(args.output.glob('b*/*/result.json')) if '-profile' not in str(p.parent)]
     reference=next((r for _,r in records if r['method']=='transformers' and r['batch_size']==8 and r['status']=='complete'),None)
     if reference is None: raise ValueError('Completed batch-8 Transformers reference required')

@@ -1,13 +1,11 @@
 from pathlib import Path
-import sys
 
 import pytest
 import torch
 from safetensors.torch import save_file
 
-sys.path.insert(0,str(Path(__file__).parents[1]/'benchmarks'))
 import extraction_speed as speed
-from nemotron_extraction import HookSite,HFExtractor,VLLMExtractor
+from nemotron_extraction import HookSite
 
 
 def test_workload_preserves_all_tokens_and_full_shapes():
@@ -43,10 +41,3 @@ def test_pruning_rejects_paths_outside_this_configuration(tmp_path):
     with pytest.raises(ValueError,match='outside'):
         speed.prune_receipts(dict(receipts=[dict(path=str(outside))]),tmp_path/'run')
     assert outside.exists()
-
-
-@pytest.mark.parametrize('factory',[HFExtractor,VLLMExtractor])
-@pytest.mark.parametrize('threads',[0,3,True])
-def test_writer_limit_rejected_before_loading(factory,threads):
-    with pytest.raises(ValueError,match='publication_threads'):
-        factory('unused',[HookSite(0,'resid_post')],publication_threads=threads)

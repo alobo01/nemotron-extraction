@@ -2,21 +2,17 @@
 # requires-python = ">=3.10"
 # dependencies = ["nemotron-extraction[hf,vllm,benchmark]==1.1.0"]
 # ///
-"""Reusable backend phase for a three-language, asynchronous batch-size sweep.
+"""Resumable asynchronous batch-size sweep over all three languages.
 
-uv run --no-project benchmarks/sweep.py backend --backend hf --batch-size 8 \
-    --work outputs/tokens --output outputs/sweep
-Run the corresponding vllm phase next, then `report --output outputs/sweep`.
+uv run benchmarks/sweep.py backend --backend hf --batch-size 8 --work outputs/tokens --output outputs/sweep
+Run the matching vllm phase next, then `report --output outputs/sweep`.
 """
 from __future__ import annotations
 import argparse
 import asyncio
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
-import hashlib
-import importlib.util
 import json
-import math
 import multiprocessing
 import os
 from pathlib import Path
@@ -29,20 +25,14 @@ from safetensors.torch import load_file, save_file
 from nemotron_extraction import HFExtractor, VLLMExtractor, HookSite
 from nemotron_extraction.hooks import representative_sites
 
-spec = importlib.util.spec_from_file_location("validate", Path(__file__).with_name("validate.py"))
-validate = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(validate)
+from benchlib.common import (DATA, batches, digest, is_memory_failure, job_minutes, load_tokens, package_hashes,
+                             versions, write_json)
+from benchlib.instrumentation import chrome_trace, overlap_seconds
+from benchlib.stats import Agreement
+
 SIZES = (8, 16, 32, 64, 128)
 TIMINGS = ("model_forward_seconds", "worker_forward_seconds", "cpu_copy_seconds", "worker_copy_seconds",
            "worker_write_seconds", "generate_seconds", "backpressure_seconds", "final_drain_seconds")
-
-
-def package_digest():
-    import nemotron_extraction
-    digest = hashlib.sha256()
-    for path in sorted(Path(nemotron_extraction.__file__).parent.glob("*.py")):
-        digest.update(path.name.encode() + path.read_bytes())
-    return digest.hexdigest()
 
 
 def compare(paths, samples):
@@ -56,13 +46,70 @@ def compare(paths, samples):
         raise ValueError("Hook sites differ")
     result = {}
     for key in reference:
-        metric = validate.Agreement()
+        metric = Agreement()
         metric.add(reference[key], candidate[key])
         result[key] = (metric.result(), torch.cat(metric.cosines))
         if samples:
             save_file({"hf": reference[key][:8].clone(), "vllm": candidate[key][:8].clone()},
                       str(Path(samples) / f"sample-{key}.safetensors"))
     return result, time.perf_counter() - started
+
+
+def restore_checkpoints(args, tokens, identity, checkpoint_dir, output_dir, metrics):
+    """Reload the committed shard prefix of an interrupted language; fold its agreement into `metrics`."""
+    checkpoints = []
+    for index, batch in enumerate(batches(tokens, args.batch_size, 2048)):
+        checkpoint = checkpoint_dir / f"{args.backend}-{index:06d}.json"
+        if not checkpoint.exists():
+            break
+        value = json.loads(checkpoint.read_text())
+        if value["identity"] != identity or value["tokens"] != batch.numel():
+            raise ValueError("Resume shard identity/count differs")
+        if args.backend == "hf":
+            with safe_open(str(output_dir / f"{index:06d}.safetensors"), framework="pt") as saved:
+                if not torch.equal(saved.get_tensor("token_ids"), batch):
+                    raise ValueError("Resume token order differs")
+        elif metrics is not None:
+            cosines = load_file(str(checkpoint.with_suffix(".safetensors")))
+            for key, result in value["agreement"].items():
+                metrics[key].merge_result(result, cosines[key])
+        checkpoints.append(value)
+    return checkpoints
+
+
+def language_record(extractor, args, manifest, language, timeline, checkpoints, before, **totals):
+    """Receipt for one completed language: throughput, stage timings, provenance and memory peaks."""
+    timings = {key: getattr(extractor, key) - value for key, value in before.items()}
+    # GPU event intervals remain exact when a phase continues after a job deadline.
+    def event_seconds(name):
+        return sum(item["end"] - item["start"] for item in timeline if item["name"] == name)
+    forward_key = "model_forward_seconds" if args.backend == "hf" else "worker_forward_seconds"
+    timings[forward_key] = event_seconds("forward")
+    timings["cpu_copy_seconds" if args.backend == "hf" else "worker_copy_seconds"] = event_seconds("D2H")
+    timings["worker_write_seconds"] = sum(item["shard"]["write_seconds"] for item in checkpoints)
+    count, forward = totals["tokens"], timings[forward_key]
+    attempts = {item.get("attempt") for item in timeline}
+    return {"status": "complete", "backend": args.backend, "language": language,
+            "batch_size": args.batch_size, "sequence_length": 2048, **totals,
+            "forward_tokens_per_second": count / forward if forward else None,
+            "disk_tokens_per_second": count / totals["publication_seconds"], **timings,
+            "timing_scope": "all committed shards; admission/generation/drain counters cover current attempt",
+            "actual_forward_batches": dict(Counter(
+                size for checkpoint in checkpoints for size in checkpoint["shard"].get("actual_forward_batches",
+                    [min(args.batch_size, max(1, checkpoint["tokens"] // 2048))]))),
+            # Events from different attempts use different clock origins, so overlap is per attempt.
+            "overlap_seconds": {name: sum(overlap_seconds([item for item in timeline if item.get("attempt") == attempt], name)
+                                          for attempt in attempts)
+                                for name in ("D2H", "write")},
+            "topology": extractor.topology, "software": versions(),
+            "gpu": torch.cuda.get_device_name(), "manifest_sha256": digest(args.work / "manifest.json"),
+            "package_hashes": package_hashes(), "script_sha256": digest(__file__),
+            "source": {"model_revision": manifest["model_revision"], "tokenizer_revision": manifest["tokenizer_revision"],
+                       "dataset": manifest["languages"][language]}, "cuda_graphs_enabled": False,
+            "memory_limit_fraction": .96, "kv_cache_memory_bytes": getattr(extractor, "kv_cache_memory_bytes", None),
+            **{key: getattr(extractor, key) for key in ("peak_gpu_memory_bytes", "peak_gpu_reserved_bytes",
+                                                        "peak_device_memory_bytes", "total_device_memory_bytes",
+                                                        "peak_device_memory_fraction")}}
 
 
 async def language(extractor, args, manifest, language, comparison_pool):
@@ -72,62 +119,37 @@ async def language(extractor, args, manifest, language, comparison_pool):
     if receipt_path.exists():
         record = json.loads(receipt_path.read_text())
         if (record.get("status") == "complete" and record["tokens"] == args.tokens
-                and record["package_sha256"] == package_digest()
-                and record["manifest_sha256"] == validate.sha256(args.work / "manifest.json")
-                and record["script_sha256"] == validate.sha256(__file__)):
+                and record["package_hashes"] == package_hashes()
+                and record["manifest_sha256"] == digest(args.work / "manifest.json")
+                and record["script_sha256"] == digest(__file__)):
             print(f"resume: {args.backend}/{language}/b{args.batch_size} already complete", flush=True)
             return record
         raise ValueError("Existing incompatible receipt; use a fresh output directory")
-    token_path = args.work / f"{language}.safetensors"
-    if validate.sha256(token_path) != manifest["languages"][language]["token_sha256"]:
-        raise ValueError("Frozen token checksum mismatch")
-    tokens = load_file(str(token_path))["token_ids"][:args.tokens]
+    tokens = load_tokens(args.work, language, manifest)[:args.tokens]
     output_dir = run / ("reference" if args.backend == "hf" else "candidate")
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir = run / "checkpoints"
     checkpoint_dir.mkdir(exist_ok=True)
-    identity = {"package_sha256": package_digest(), "manifest_sha256": validate.sha256(args.work / "manifest.json"),
-                "script_sha256": validate.sha256(__file__), "batch_size": args.batch_size, "tokens": args.tokens}
+    identity = {"package_hashes": package_hashes(), "manifest_sha256": digest(args.work / "manifest.json"),
+                "script_sha256": digest(__file__), "batch_size": args.batch_size, "tokens": args.tokens}
     identity_path = run / f"{args.backend}-identity.json"
     if identity_path.exists() and json.loads(identity_path.read_text()) != identity:
         raise ValueError("Resume identity differs; use a fresh output directory")
-    validate.write_json(identity_path, identity)
-    before = {key: getattr(extractor, key, 0.) for key in TIMINGS}
-    histogram_start = len(extractor.actual_forward_batches)
-    count, pending, comparisons, timeline, prefix = 0, [], 0., [], 0
-    base_elapsed = 0.
+    write_json(identity_path, identity)
+    before = {key: getattr(extractor, key) for key in TIMINGS if hasattr(extractor, key)}
+    pending = []
     epoch = uuid.uuid4().hex
-    metrics = {site.key: validate.Agreement() for site in extractor.sites}
+    metrics = {site.key: Agreement() for site in extractor.sites}
     hf_run = run.parent / "hf-run.json"
     can_compare = (args.backend == "vllm" and hf_run.exists()
                    and json.loads(hf_run.read_text())["status"] == "complete")
-    checkpoints = []
-    for index, batch in enumerate(validate.batches(tokens, args.batch_size, 2048)):
-        checkpoint = checkpoint_dir / f"{args.backend}-{index:06d}.json"
-        if not checkpoint.exists():
-            break
-        value = json.loads(checkpoint.read_text())
-        if value["identity"] != identity or value["tokens"] != batch.numel():
-            raise ValueError("Resume shard identity/count differs")
-        if args.backend == "hf":
-            path = output_dir / f"{index:06d}.safetensors"
-            with safe_open(str(path), framework="pt") as saved:
-                if not torch.equal(saved.get_tensor("token_ids"), batch):
-                    raise ValueError("Resume token order differs")
-        elif can_compare:
-            cosines = load_file(str(checkpoint.with_suffix(".safetensors")))
-            for key, result in value["agreement"].items():
-                metric = metrics[key]
-                metric.cosines.append(cosines[key])
-                metric.error2 += result["error_squared_sum"]
-                metric.reference2 += result["reference_squared_sum"]
-                metric.max_error = max(metric.max_error, result["maximum_absolute_error"])
-            comparisons += value["comparison_seconds"]
-        checkpoints.append(value)
-        count += value["tokens"]
-        base_elapsed = value["pipeline_elapsed"]
-        timeline.extend(value["shard"].get("timeline", []))
-        prefix += 1
+    checkpoints = restore_checkpoints(args, tokens, identity, checkpoint_dir, output_dir,
+                                      metrics if can_compare else None)
+    prefix = len(checkpoints)
+    count = sum(value["tokens"] for value in checkpoints)
+    comparisons = sum(value["comparison_seconds"] for value in checkpoints) if can_compare else 0.
+    base_elapsed = checkpoints[-1]["pipeline_elapsed"] if checkpoints else 0.
+    timeline = [item for value in checkpoints for item in value["shard"].get("timeline", [])]
     # Incomplete publications carry no committed checkpoint and can be retried.
     for path in output_dir.glob("*.safetensors*"):
         if args.backend == "vllm" or int(path.name.split(".")[0]) >= prefix:
@@ -143,21 +165,17 @@ async def language(extractor, args, manifest, language, comparison_pool):
         values, seconds = await asyncio.wrap_future(future)
         comparisons += seconds
         for key, (value, cosines) in values.items():
-            target = metrics[key]
-            target.cosines.append(cosines)
-            target.error2 += value["error_squared_sum"]
-            target.reference2 += value["reference_squared_sum"]
-            target.max_error = max(target.max_error, value["maximum_absolute_error"])
+            metrics[key].merge_result(value, cosines)
         checkpoint = checkpoint_dir / f"vllm-{global_index:06d}.json"
         save_file({key: cosine for key, (_, cosine) in values.items()}, str(checkpoint.with_suffix(".safetensors")))
         committed = {"identity": identity, "tokens": shard["tokens"], "shard": shard,
                      "comparison_seconds": seconds, "agreement": {key: value for key, (value, _) in values.items()},
                      "pipeline_elapsed": base_elapsed + time.perf_counter() - started}
-        validate.write_json(checkpoint, committed)
+        write_json(checkpoint, committed)
         checkpoints.append(committed)
         Path(paths[1]).unlink()
 
-    remaining = (batch for index, batch in enumerate(validate.batches(tokens, args.batch_size, 2048)) if index >= prefix)
+    remaining = (batch for index, batch in enumerate(batches(tokens, args.batch_size, 2048)) if index >= prefix)
     # Candidate filenames are relative to the current attempt; reference/checkpoint IDs stay global.
     stream_dir = output_dir if args.backend == "hf" and not prefix else output_dir / f"from-{prefix}"
     stream_dir.mkdir(exist_ok=True)
@@ -180,7 +198,7 @@ async def language(extractor, args, manifest, language, comparison_pool):
                     shard["path"] = str(canonical)
                 committed = {"identity": identity, "tokens": shard["tokens"], "shard": shard,
                              "pipeline_elapsed": base_elapsed + last_publication - started}
-                validate.write_json(checkpoint_dir / f"hf-{global_index:06d}.json", committed)
+                write_json(checkpoint_dir / f"hf-{global_index:06d}.json", committed)
                 checkpoints.append(committed)
             if can_compare:
                 reference = run / "reference" / f"{global_index:06d}.safetensors"
@@ -194,7 +212,7 @@ async def language(extractor, args, manifest, language, comparison_pool):
             elif args.backend == "vllm":
                 committed = {"identity": identity, "tokens": shard["tokens"], "shard": shard,
                              "pipeline_elapsed": base_elapsed + last_publication - started}
-                validate.write_json(checkpoint_dir / f"vllm-{global_index:06d}.json", committed)
+                write_json(checkpoint_dir / f"vllm-{global_index:06d}.json", committed)
                 checkpoints.append(committed)
             if shard["index"] % 10 == 0:
                 print(f"{args.backend}/{language}/b{args.batch_size}: {count}/{args.tokens}", flush=True)
@@ -206,39 +224,9 @@ async def language(extractor, args, manifest, language, comparison_pool):
     elapsed = base_elapsed + time.perf_counter() - started
     if count != args.tokens:
         raise ValueError(f"Expected {args.tokens} prompt tokens, got {count}")
-    timings = {key: getattr(extractor, key, 0.) - before[key] for key in TIMINGS}
-    # GPU event intervals remain exact when a phase continues after a job deadline.
-    event_seconds = lambda name: sum(item["end"] - item["start"] for item in timeline if item["name"] == name)
-    timings["model_forward_seconds" if args.backend == "hf" else "worker_forward_seconds"] = event_seconds("forward")
-    timings["cpu_copy_seconds" if args.backend == "hf" else "worker_copy_seconds"] = event_seconds("D2H")
-    timings["worker_write_seconds"] = sum(item["shard"]["write_seconds"] for item in checkpoints)
-    forward = timings["model_forward_seconds"] if args.backend == "hf" else timings["worker_forward_seconds"]
-    record = {"status": "complete", "backend": args.backend, "language": language,
-              "batch_size": args.batch_size, "tokens": count, "sequence_length": 2048,
-              "publication_seconds": publication_seconds, "phase_seconds": elapsed,
-              "forward_tokens_per_second": count / forward if forward else None,
-              "disk_tokens_per_second": count / publication_seconds,
-              "comparison_seconds": comparisons, **timings,
-              "resumed_shards": prefix, "timing_scope": "all committed shards; admission/generation/drain counters cover current attempt",
-              "actual_forward_batches": dict(Counter(
-                  size for checkpoint in checkpoints for size in checkpoint["shard"].get("actual_forward_batches",
-                      [min(args.batch_size, max(1, checkpoint["tokens"] // 2048))]))),
-              "topology": extractor.topology, "software": validate.versions(),
-              "gpu": torch.cuda.get_device_name(), "manifest_sha256": validate.sha256(args.work / "manifest.json"),
-              "package_sha256": package_digest(), "script_sha256": validate.sha256(__file__),
-              "source": {"model_revision": manifest["model_revision"], "tokenizer_revision": manifest["tokenizer_revision"],
-                         "dataset": manifest["languages"][language]}, "cuda_graphs_enabled": False,
-              "memory_limit_fraction": .96, "kv_cache_memory_bytes": getattr(extractor, "kv_cache_memory_bytes", None),
-              "peak_gpu_memory_bytes": extractor.peak_gpu_memory_bytes,
-              "peak_gpu_reserved_bytes": extractor.peak_gpu_reserved_bytes,
-              "peak_device_memory_bytes": extractor.peak_device_memory_bytes,
-              "total_device_memory_bytes": extractor.total_device_memory_bytes,
-              "peak_device_memory_fraction": extractor.peak_device_memory_fraction}
-    forwards = [item for item in timeline if item["name"] == "forward"]
-    record["overlap_seconds"] = {name: sum(max(0., min(a["end"], b["end"]) - max(a["start"], b["start"]))
-                                             for a in forwards for b in timeline
-                                             if b["name"] == name and a.get("attempt") == b.get("attempt"))
-                                 for name in ("D2H", "write")}
+    record = language_record(extractor, args, manifest, language, timeline, checkpoints, before,
+                             tokens=count, publication_seconds=publication_seconds, phase_seconds=elapsed,
+                             comparison_seconds=comparisons, resumed_shards=prefix)
     if can_compare:
         record["agreement"] = {key: metric.result() for key, metric in metrics.items()}
         record["passed"] = all(metric["passed"] for metric in record["agreement"].values())
@@ -249,11 +237,8 @@ async def language(extractor, args, manifest, language, comparison_pool):
         for path in output_dir.glob("*.safetensors"):
             path.unlink()
     if args.profile:
-        validate.write_json(run / f"{args.backend}-trace.json", {"traceEvents": [
-            {"name": item["name"], "ph": "X", "pid": args.backend, "tid": item["name"],
-             "ts": item["start"] * 1e6, "dur": (item["end"] - item["start"]) * 1e6,
-             "args": {"attempt": item.get("attempt")}} for item in timeline]})
-    validate.write_json(receipt_path, record)
+        write_json(run / f"{args.backend}-trace.json", chrome_trace(timeline, args.backend))
+    write_json(receipt_path, record)
     if can_compare:
         # Baseline deletion follows durable language metrics, never an uncommitted comparison.
         for path in (run / "reference").glob("*.safetensors"):
@@ -270,6 +255,7 @@ def backend(args):
     started = time.perf_counter()
     extractor = None
     records = []
+    summary = None
     phase = "startup"
     try:
         if args.backend == "hf":
@@ -279,7 +265,7 @@ def backend(args):
             model_load = time.perf_counter() - started
             sites = representative_sites(model)
             extractor = HFExtractor(model, sites)
-            validate.write_json(sites_file, [{"layer": site.layer, "kind": site.kind} for site in sites])
+            write_json(sites_file, [{"layer": site.layer, "kind": site.kind} for site in sites])
         else:
             sites = [HookSite(**site) for site in json.loads(sites_file.read_text())]
             extractor = VLLMExtractor(manifest["model_path"], sites, sequences_per_call=args.batch_size,
@@ -299,26 +285,22 @@ def backend(args):
                 async for receipt in extractor.stream_to_disk([warm_tokens, warm_tokens], directory):
                     traces.extend(receipt.get("timeline", []))
                 if args.profile:
-                    validate.write_json(root / f"{args.backend}-warmup-trace.json", {"traceEvents": [
-                        {"name": item["name"], "ph": "X", "pid": args.backend, "tid": item["name"],
-                         "ts": item["start"] * 1e6, "dur": (item["end"] - item["start"]) * 1e6} for item in traces]})
+                    write_json(root / f"{args.backend}-warmup-trace.json", chrome_trace(traces, args.backend))
         asyncio.run(warmup())
         warmup_seconds = time.perf_counter() - warm_started
         phase = "extraction"
         with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as pool:
-            for lang in ("en", "de", "es"):
+            for lang in DATA:
                 records.append(asyncio.run(language(extractor, args, manifest, lang, pool)))
         summary = {"status": "complete", "startup_seconds": startup, "model_load_seconds": model_load,
                    "hook_install_seconds": extractor.hook_install_seconds, "warmup_seconds": warmup_seconds,
                    "phase_seconds": time.perf_counter() - started, "languages": records}
     except Exception as error:
-        message = str(error)
-        memory_failure = isinstance(error, torch.OutOfMemoryError) or any(
-            text in message.lower() for text in ("out of memory", "gpu memory budget exceeded", "no available memory"))
+        memory_failure = is_memory_failure(error)
         summary = {"status": "memory_failure" if memory_failure else "error", "failed_phase": phase,
-                   "error_type": type(error).__name__, "error": message,
+                   "error_type": type(error).__name__, "error": str(error),
                    "phase_seconds": time.perf_counter() - started, "languages": records}
-        validate.write_json(root / f"{args.backend}-run.json", summary)
+        write_json(root / f"{args.backend}-run.json", summary)
         if not memory_failure:
             raise
     finally:
@@ -326,19 +308,19 @@ def backend(args):
             try:
                 extractor.close()
             except Exception as cleanup_error:
-                if "summary" not in locals() or summary["status"] == "complete":
+                if summary is None or summary["status"] == "complete":
                     raise
                 summary["cleanup_error"] = str(cleanup_error)
     summary.update(backend=args.backend, batch_size=args.batch_size, requested_tokens=args.tokens,
-                   package_sha256=package_digest(), software=validate.versions())
-    validate.write_json(root / f"{args.backend}-run.json", summary)
+                   package_hashes=package_hashes(), software=versions())
+    write_json(root / f"{args.backend}-run.json", summary)
     print(json.dumps({key: summary[key] for key in ("status", "backend", "batch_size", "phase_seconds")}), flush=True)
 
 
 def report(args):
     rows = []
     for batch in SIZES:
-        for lang in ("en", "de", "es"):
+        for lang in DATA:
             pair = []
             for engine in ("hf", "vllm"):
                 path = args.output / f"b{batch}" / lang / f"{engine}.json"
@@ -347,14 +329,14 @@ def report(args):
                             json.loads(run_path.read_text()) if run_path.exists() else {"status": "pending"})
             hf, vllm = pair
             if hf["status"] == vllm["status"] == "complete" and "tokens" in hf and "tokens" in vllm:
-                for key in ("tokens", "batch_size", "manifest_sha256", "package_sha256", "script_sha256", "source"):
+                for key in ("tokens", "batch_size", "manifest_sha256", "package_hashes", "script_sha256", "source"):
                     if hf[key] != vllm[key]:
                         raise ValueError(f"Backend receipts disagree on {key}")
                 speedup = vllm["disk_tokens_per_second"] / hf["disk_tokens_per_second"]
                 rows.append({"batch": batch, "language": lang, "hf": hf, "vllm": vllm, "disk_speedup": speedup})
             else:
                 rows.append({"batch": batch, "language": lang, "hf": hf, "vllm": vllm})
-    validate.write_json(args.output / "results.json", rows)
+    write_json(args.output / "results.json", rows)
     lines = ["# Asynchronous activation batch sweep", "", "| Batch | Language | HF disk tok/s | vLLM disk tok/s | Ratio | Gate/status |",
              "|---:|---|---:|---:|---:|---|"]
     for row in rows:
@@ -384,9 +366,8 @@ def schedule(args):
                 raise ValueError("Pilot must cover all languages or document a memory failure")
             total += record["startup_seconds"] + record["warmup_seconds"]
             total += sum(lang["phase_seconds"] / lang["tokens"] * 1_000_000 for lang in record["languages"])
-        jobs.append({"batch_size": batch, "estimated_seconds": total,
-                     "minutes": math.ceil((total * 1.25 + 120) / 300) * 5})
-    minutes = math.ceil((sum(job["estimated_seconds"] for job in jobs) * 1.25 + 120) / 300) * 5
+        jobs.append({"batch_size": batch, "estimated_seconds": total, "minutes": job_minutes(total)})
+    minutes = job_minutes(sum(job["estimated_seconds"] for job in jobs))
     print(json.dumps({"combined_minutes": minutes, "fits_one_job": minutes <= 60, "batch_jobs": jobs}, indent=2))
 
 

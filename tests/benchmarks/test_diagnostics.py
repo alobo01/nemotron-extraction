@@ -1,60 +1,18 @@
-"""Numerical diagnostics must distinguish computation, identity and transport."""
-import json
+"""benchlib diagnostics must distinguish computation, identity and transport."""
+import hashlib
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
-from safetensors.torch import load_file
 
+from benchlib.instrumentation import overlap_seconds
 from benchlib.moe import manual_nemotron_moe, manual_sigmoid_router, routing_report
-from benchlib.stats import TokenDiagnostics
+from benchlib.precision import checkpoint_source_reference, ieee_precision, precision_settings
+from benchlib.sibling import configured_chunked_prefill, configured_kv_cache_bytes, sibling_namespace
 from benchlib.trace import TraceHooks, runtime_config
 from benchlib.workers import DiagnosticWorker
-import diagnose_divergence as diagnostic
-
-
-def ids(n,offset=0):
-    return [dict(row_id=f'row-{i:04d}',sequence_id='short' if i<37 else 'long',position=i if i<37 else i-37,token_id=i)
-            for i in range(offset,offset+n)]
-
-
-def test_zero_vectors_are_explicit_and_gates_unchanged():
-    h=torch.tensor([[0.,0.],[0.,0.],[1.,0.]])
-    v=torch.tensor([[0.,0.],[1.,0.],[-1.,0.]])
-    d=TokenDiagnostics();d.add(h,v,ids(3));r=d.result()
-    assert r['both_zero_rows']==1 and r['one_zero_rows']==1
-    assert r['minimum_cosine']==-1 and not r['passed']
-    assert r['normalized_mse']==5 and r['relative_l2']==pytest.approx(5**.5)
-    assert r['worst_cosine'][1]['relative_error_undefined']
-    json.dumps(r,allow_nan=False)
-
-
-def test_shard_merge_ranking_and_error_budget_match_full_arrays(tmp_path):
-    gen=torch.Generator().manual_seed(8)
-    h=torch.randn(75,9,generator=gen);v=h.clone();v[55]*=-1;v[72]+=2
-    whole=TokenDiagnostics();whole.add(h,v,ids(75))
-    merged=TokenDiagnostics()
-    for a,b in ((0,37),(37,68),(68,75)):
-        piece=TokenDiagnostics();piece.add(h[a:b],v[a:b],ids(b-a,a));merged.merge(piece)
-    assert merged.result()==whole.result()
-    assert merged.result()['worst_cosine'][0]['position']==18
-    assert merged.result()['worst_error'][0]['row_id'] in ('row-0055','row-0072')
-    assert len(merged.samples)<=40
-    merged.save_samples(tmp_path/'worst.safetensors')
-    assert load_file(str(tmp_path/'worst.safetensors'))
-    with pytest.raises(ValueError,match='Duplicate'): merged.merge(whole)
-
-
-def test_normalization_retains_scale_error_and_rejects_bad_rows():
-    h=torch.ones(40,3,dtype=torch.bfloat16);v=h*2
-    d=TokenDiagnostics();d.add(h,v,ids(40));r=d.result()
-    assert r['normalized_mse']==1 and not r['passed']
-    assert r['mean_cosine']==pytest.approx(1,abs=1e-6)
-    with pytest.raises(ValueError,match='Nonfinite'):
-        TokenDiagnostics().add(h.float(),h.float()*float('nan'),ids(40))
-    with pytest.raises(ValueError,match='identity'):
-        TokenDiagnostics().add(h,v,ids(39))
+from precision_validation import gate_passed
 
 
 class Mixer(nn.Module):
@@ -112,51 +70,6 @@ def test_scheduler_records_reordered_duplicates_and_rejects_partial_prefill():
     with pytest.raises(RuntimeError,match='Partial prefill'): worker._diag_inputs(None,(),{})
 
 
-def test_case_definitions_keep_anchor_identity_and_short_tail():
-    rows=torch.arange(64*2048).reshape(64,2048)
-    for name,tokens,anchor in diagnostic.cases(rows):
-        expected=rows[0,:37] if name=='short37' else (rows[0,:128] if name=='short128' else rows[0])
-        assert torch.equal(tokens[anchor],expected)
-    assert diagnostic.boundary_order('L02_mixer_input')<diagnostic.boundary_order('L02_mixer_out')
-
-
-def test_comparison_selects_first_failure_and_saves_worst_samples(tmp_path):
-    from safetensors.torch import save_file
-    for engine in ('transformers','vllm'):
-        d=tmp_path/engine;d.mkdir()
-        h=torch.ones(37,4);v=h if engine=='transformers' else h*2
-        save_file({'token_ids':torch.arange(37),'embedding':h.clone(),'L00_resid_pre':h.clone(),
-                   'L00_mixer_input':h.clone(),'L00_mixer_out':v.clone(),'L00_resid_post':v.clone()},str(d/'alone.safetensors'))
-    diagnostic.analyse(SimpleNamespace(output=tmp_path))
-    result=json.loads((tmp_path/'analysis.json').read_text())
-    assert result['first_failing_boundary']=='L00_mixer_out'
-    assert result['replay']['key']=='L00_mixer_input'
-    assert result['gates_unchanged']
-
-
-def test_original_transformers_persistence_matches_same_forward_oracle_and_reuses_buffers(tmp_path):
-    import asyncio
-    from nemotron_extraction import HookSite
-    class Decoder(nn.Module):
-        def __init__(self):
-            super().__init__();self.layers=nn.ModuleList([Block()])
-        def forward(self,input_ids,use_cache=False):
-            return self.layers[0](input_ids.float().unsqueeze(-1).repeat(1,1,4))
-    class Wrapper(nn.Module):
-        def __init__(self): super().__init__();self.model=Decoder()
-    model=Wrapper()
-    with diagnostic.IntegrityHFExtractor(model,[HookSite(0,'resid_pre'),HookSite(0,'resid_post')],device='cpu') as extractor:
-        rows=torch.tensor([[1,2,3],[4,5,6],[1,2,3]])
-        async def collect():
-            return [r async for r in extractor.stream_to_disk([rows,rows.flip(0),rows[:1,:2]],tmp_path)]
-        receipts=asyncio.run(collect())
-        assert all(r['diagnostic_transport_exact'] for r in receipts)
-        assert {r['diagnostic_slot'] for r in receipts}=={0,1}
-        assert torch.equal(load_file(receipts[-1]['path'])['token_ids'],rows[:1,:2])
-        assert sorted(extractor.pool.free)==[0,1]
-    assert not model.model._forward_hooks
-
-
 def test_same_forward_comparison_detects_disagreement_before_transport():
     worker=DiagnosticWorker()
     worker.diag_case={'integrity':True,'equality':[]}
@@ -207,11 +120,110 @@ def test_manual_nemotron_moe_matches_explicit_non_gated_equations():
     assert torch.allclose(result['output'],ref)
 
 
-def test_anchor_rule_is_reported_alongside_unchanged_strict_gates():
-    reference=torch.ones(100,8)
-    candidate=reference.clone();candidate[-1]*=-1
-    result=diagnostic.pair_metrics(reference,candidate)
-    assert result['rows_cosine_at_least_0_990']==99
-    assert result['passes_anchor_99_percent_rule']
-    assert not result['strict_mean_cosine_pass']
-    assert not result['strict_minimum_cosine_pass']
+def test_reference_accumulation_preserves_expert_order_under_cancellation():
+    x = torch.ones(1, 1)
+    up = torch.ones(3, 1, 1)
+    down = torch.tensor([1e8, -1e8, 1.]).reshape(3, 1, 1)
+    # Slot order gives (1e8 + 1) - 1e8 == 0; expert order gives 1.
+    result = manual_nemotron_moe(x, torch.tensor([[0, 2, 1]]), torch.ones(1, 3), up, down)
+    assert torch.equal(result['output'], torch.ones(1, 1))
+
+
+def test_ieee_precision_restores_state_after_failure():
+    previous = precision_settings()
+    with pytest.raises(RuntimeError, match='controlled failure'):
+        with ieee_precision() as current:
+            assert current['bf16_reduced_reduction'] is False
+            if current['api'] == 'modern':
+                assert all(current[k] == 'ieee' for k in ('global', 'matmul', 'cudnn', 'conv', 'rnn'))
+            else:
+                assert not current['matmul_tf32'] and not current['cudnn_tf32']
+            raise RuntimeError('controlled failure')
+    assert precision_settings() == previous
+
+
+def test_reference_source_checksum_and_missing_classes_fail_closed(tmp_path):
+    source = tmp_path / 'reference.py'
+    source.write_text('raise RuntimeError("imports must not execute")\n')
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match='checksum'):
+        checkpoint_source_reference(source, '0'*64, {})
+    with pytest.raises(ValueError, match='class'):
+        checkpoint_source_reference(source, digest, {})
+
+
+def test_source_loader_uses_frozen_classes_without_executing_imports(tmp_path):
+    source = tmp_path / 'reference.py'
+    source.write_text('''
+raise RuntimeError("Mamba imports must not execute")
+class NemotronHMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+class NemotronHTopkRouter(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+class NemotronHMOE(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.weight = nn.Parameter(torch.empty(config.hidden_size))
+''')
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    model = checkpoint_source_reference(source, digest, dict(hidden_size=7))
+    assert model.weight.device.type == 'meta'
+    assert model.weight.shape == (7,)
+    assert model.layer_idx == 1
+
+
+def test_final_validation_requires_every_precision_and_probe_check():
+    result = dict(strict_pass=True, exact_router_logits=True,
+                  expert_sets_equal=True, persisted_samples_exact=True)
+    assert gate_passed(result)
+    for key in result:
+        assert not gate_passed(dict(result, **{key: False}))
+
+
+def snapshot(directory):
+    (directory / "attention.py").write_text('def output_projection(m): return m\n')
+    (directory / "worker.py").write_text('''
+import missing_training_package
+MIXER_KINDS = {"moe_out": "MoE"}
+class ActivationHookExtension:
+    def sae_install_hooks(self): pass
+    def _sae_end_step(self): pass
+    def sae_save(self): pass
+    def sae_flush_saves(self): pass
+    def sae_flush(self): pass
+def assemble_rows(steps, tokens, keys):
+    return {k: torch.cat([step[k] for step in steps]) for k in keys}
+''')
+
+
+def test_snapshot_preserves_definitions_and_constants_without_training_imports(tmp_path):
+    snapshot(tmp_path)
+    scope = sibling_namespace(tmp_path)
+    assert scope["MIXER_KINDS"] == {"moe_out":"MoE"}
+    assert hasattr(scope["ActivationHookExtension"], "sae_save")
+    assert scope["output_projection"](42) == 42
+
+
+def test_cache_size_is_automatic_unless_explicit(monkeypatch):
+    monkeypatch.delenv("NH_KV_CACHE_BYTES", raising=False)
+    assert configured_kv_cache_bytes() is None
+    monkeypatch.setenv("NH_KV_CACHE_BYTES", "4096")
+    assert configured_kv_cache_bytes() == 4096
+    monkeypatch.delenv("NH_ENABLE_CHUNKED_PREFILL", raising=False)
+    assert configured_chunked_prefill() is True
+    monkeypatch.setenv("NH_ENABLE_CHUNKED_PREFILL", "false")
+    assert configured_chunked_prefill() is False
+
+
+def test_overlap_union_does_not_double_count_and_handles_no_overlap():
+    timeline = [{"name": "forward", "start": 1., "end": 4.},
+                {"name": "forward", "start": 3., "end": 5.},
+                {"name": "D2H", "start": 2., "end": 4.5},
+                {"name": "D2H", "start": 4., "end": 6.},
+                {"name": "write", "start": 6., "end": 7.}]
+    assert overlap_seconds(timeline, "D2H") == 3.
+    assert overlap_seconds(timeline, "write") == 0.
+    assert overlap_seconds([], "write") == 0.

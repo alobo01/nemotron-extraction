@@ -2,17 +2,15 @@
 # requires-python = ">=3.10"
 # dependencies = ["nemotron-extraction[vllm,benchmark]==1.1.0"]
 # ///
-"""Same-runtime layer-1 operator validation; full anchor is gated by a short probe.
+"""Validate vLLM's layer-1 expert operation against the checkpoint's Transformers source.
 
-Install the frozen wheel with uv. Infrastructure settings are supplied externally.
-This compares the checkpoint's Transformers MoE source with vLLM's expert
-operation. It does not claim full-model or extraction-throughput equivalence.
+Both run in one runtime on frozen anchor inputs; a short probe gates the full anchor.
+This does not establish full-model or extraction-throughput equivalence.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 from pathlib import Path
 import sys
 import time
@@ -21,10 +19,9 @@ import traceback
 import torch
 from safetensors import safe_open
 
-from benchlib.common import digest, write_json
+from benchlib.common import ANCHOR_SHA256, anchor_digest, anchor_inputs, digest, versions, write_json
+from benchlib.instrumentation import Utilisation
 from benchlib.precision import ieee_precision
-from targeted_validation import Utilisation
-from diagnose_divergence import ANCHOR_SHA256, inputs, software
 
 
 def gate_passed(result):
@@ -35,8 +32,8 @@ def gate_passed(result):
 async def run(args):
     from vllm import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
-    manifest, rows = inputs(args.work)
-    anchor_hash = hashlib.sha256(rows[0].cpu().numpy().astype('<i8').tobytes()).hexdigest()
+    manifest, rows = anchor_inputs(args.work)
+    anchor_hash = anchor_digest(rows)
     if anchor_hash != ANCHOR_SHA256:
         raise ValueError('Frozen anchor checksum differs')
     for trace in (args.transformers_trace, args.vllm_trace):
@@ -46,8 +43,8 @@ async def run(args):
     args.output.mkdir(parents=True, exist_ok=False)
     receipt = dict(status='running', scope='Layer-1 expert operation on frozen anchor inputs',
         full_model_equivalence_established=False, anchor_sha256=anchor_hash,
-        model_revision=manifest['model_revision'], software=software(), command=sys.argv,
-        script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        model_revision=manifest['model_revision'], software=versions(), command=sys.argv,
+        script_sha256=digest(__file__),
         input_trace_sha256={str(p): digest(p)
                             for p in (args.transformers_trace, args.vllm_trace)},
         reference_source_sha256=args.reference_source_sha256,
