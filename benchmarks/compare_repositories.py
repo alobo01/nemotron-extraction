@@ -12,11 +12,7 @@ methods are unchanged. Infrastructure settings do not belong in this script.
 from __future__ import annotations
 
 import argparse
-import ast
 import asyncio
-from collections.abc import Iterable
-from concurrent.futures import Future, ThreadPoolExecutor
-from functools import partial
 import json
 import os
 from pathlib import Path
@@ -26,9 +22,9 @@ import time
 import traceback
 
 import torch
-from torch import nn
 from safetensors.torch import load_file, save_file
 from nemotron_extraction import HFExtractor, HookSite, VLLMExtractor
+from nemotron_extraction import diagnostics
 from nemotron_extraction.hooks import representative_sites, resolve
 from targeted_validation import Utilisation, overlap_seconds
 from validate import Agreement, MODEL, batches, sha256, versions, write_json
@@ -50,19 +46,7 @@ def configured_chunked_prefill():
 
 def sibling_namespace(directory):
     """Retain original function/class bodies; exclude unrelated package imports."""
-    scope = dict(torch=torch, nn=nn, json=json, time=time, Path=Path, partial=partial,
-                 ThreadPoolExecutor=ThreadPoolExecutor, Future=Future, Iterable=Iterable,
-                 save_file=save_file)
-    for filename in ("attention.py", "worker.py"):
-        tree = ast.parse((Path(directory) / filename).read_text())
-        definitions = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
-        definitions.extend(n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)))
-        # Preserve the original mixer dispatch table as well as the definitions.
-        definitions.extend(n for n in tree.body if isinstance(n, ast.Assign)
-                           and any(isinstance(t, ast.Name) and t.id in ("MIXER_KINDS", "RESIDUAL_KINDS")
-                                   for t in n.targets))
-        exec(compile(ast.fix_missing_locations(ast.Module(body=definitions, type_ignores=[])),
-                     str(Path(directory) / filename), "exec"), scope)
+    scope = diagnostics.sibling_namespace(directory)
     required = ("sae_install_hooks", "_sae_end_step", "sae_save", "sae_flush_saves", "sae_flush")
     if not all(hasattr(scope["ActivationHookExtension"], name) for name in required):
         raise ValueError("Sibling source lacks the expected file/fill interface")

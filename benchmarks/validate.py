@@ -22,6 +22,7 @@ import time
 import torch
 from safetensors.torch import load_file, save_file
 from nemotron_extraction import HFExtractor, VLLMExtractor, HookSite
+from nemotron_extraction.diagnostics import digest as sha256, write_json
 from nemotron_extraction.hooks import representative_sites
 
 MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
@@ -29,22 +30,6 @@ MODEL_REVISION = "fe4143e388795a58a92974891b2e45092a53dc1d"
 DATA = {"en": ("HuggingFaceFW/fineweb-edu", "sample-10BT"),
         "de": ("HuggingFaceFW/fineweb-2", "deu_Latn"),
         "es": ("HuggingFaceFW/fineweb-2", "spa_Latn")}
-
-
-def write_json(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".partial")
-    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
-    temporary.replace(path)
-
-
-def sha256(path):
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def versions():
