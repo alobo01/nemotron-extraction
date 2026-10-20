@@ -6,6 +6,7 @@ import time
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import NamedTuple
 import torch
 from torch import nn
 from .hooks import install, repair_time_step_limits
@@ -16,6 +17,14 @@ from .types import ActivationBatch, DeviceActivationBatch, validate_publication_
 def _cuda_device_index(device: torch.device) -> int:
     """Resolve an unindexed CUDA device in the calling thread."""
     return device.index if device.index is not None else torch.cuda.current_device()
+
+
+class Capture(NamedTuple):
+    values: dict
+    copied: object
+    forward_events: object
+    copy_events: object
+    capture_events: tuple
 
 
 class HFExtractor:
@@ -82,9 +91,9 @@ class HFExtractor:
         try:
             slot = self.pool.acquire()
             try:
-                tensors, copied, events = self._capture(tokens, slot)
-                self._finish(copied, events)
-                return ActivationBatch(tokens, {site.key: tensors[site.key].clone() for site in self.sites})
+                capture = self._capture(tokens, slot)
+                self._finish(capture)
+                return ActivationBatch(tokens, {site.key: capture.values[site.key].clone() for site in self.sites})
             finally:
                 self.pool.release(slot)
         finally:
@@ -128,6 +137,7 @@ class HFExtractor:
     def _capture_locked(self, tokens, slot):
         self.captured.clear()
         self.capture_events.clear()
+        copy_events = None
         was_training = self.model.training
         try:
             self.model.eval()
@@ -165,39 +175,40 @@ class HFExtractor:
                         source.record_stream(self.copy_stream)
                     copy_end.record()
                 copied = self.copy_worker.submit(finish_copy, copy_start, copy_end, sources)
-                copied.copy_events = (copy_start, copy_end)
+                copy_events = (copy_start, copy_end)
                 self.__dict__.update(memory_peaks({key: getattr(self, key) for key in MEMORY_KEYS}, self.device))
             else:
                 for key, source in sources.items():
                     values[key].copy_(source.reshape(values[key].shape))
                 copied = self.copy_worker.submit(finish_copy, None, None, sources)
             self.actual_forward_batches.append(len(tokens))
-            copied.capture_events = tuple(self.capture_events)
-            return values, copied, events
+            return Capture(values, copied, events, copy_events, tuple(self.capture_events))
         finally:
             self.captured.clear()
             self.model.train(was_training)
 
-    def _finish(self, copied, events):
-        seconds = copied.result()
+    def _finish(self, capture):
+        seconds = capture.copied.result()
         with self.metrics_lock:
             self.cpu_copy_seconds += seconds
-            if events:
+            if capture.forward_events:
+                events = capture.forward_events
                 self.model_forward_seconds += events[0].elapsed_time(events[1]) / 1000
 
-    def _publish(self, tokens, slot, tensors, copied, events, path, index):
+    def _publish(self, tokens, slot, capture, path, index):
         try:
-            self._finish(copied, events)
+            self._finish(capture)
             write_start = time.perf_counter() - self.origin_cpu
-            receipt = publish(tensors, path)
+            receipt = publish(capture.values, path)
             with self.metrics_lock:
                 self.worker_write_seconds += receipt["write_seconds"]
                 self.validation_seconds += receipt["validation_seconds"]
                 self.serialization_seconds += receipt["serialization_seconds"]
             receipt.update(index=index, tokens=tokens.numel())
-            receipt["capture_seconds"] = capture_seconds(copied.capture_events) if self.diagnostics else None
-            receipt["timeline"] = (timeline(self.origin, (("forward", [events]), ("D2H", [copied.copy_events])))
-                                   if events else [])
+            receipt["capture_seconds"] = capture_seconds(capture.capture_events) if self.diagnostics else None
+            receipt["timeline"] = (timeline(self.origin, (("forward", [capture.forward_events]),
+                                                          ("D2H", [capture.copy_events])))
+                                   if capture.forward_events else [])
             receipt["timeline"].append({"name": "write", "start": write_start,
                                         "end": time.perf_counter() - self.origin_cpu})
             return receipt
@@ -228,14 +239,14 @@ class HFExtractor:
                     raise RuntimeError("Capture admission violated the two-slot bound")
                 try:
                     # Shield CUDA submissions: cancellation must not release a live slot.
-                    capture = loop.run_in_executor(self.producer, self._capture, tokens, slot)
+                    job = loop.run_in_executor(self.producer, self._capture, tokens, slot)
                     try:
-                        tensors, copied, events = await asyncio.shield(capture)
+                        capture = await asyncio.shield(job)
                     except asyncio.CancelledError:
-                        tensors, copied, events = await capture
-                        await asyncio.to_thread(self._finish, copied, events)
+                        capture = await job
+                        await asyncio.to_thread(self._finish, capture)
                         raise
-                    pending.append(self.writer.submit(self._publish, tokens, slot, tensors, copied, events,
+                    pending.append(self.writer.submit(self._publish, tokens, slot, capture,
                                                        Path(output_dir) / f"{index:06d}.safetensors", index))
                 except BaseException:
                     self.pool.release(slot)

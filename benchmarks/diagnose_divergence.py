@@ -331,11 +331,11 @@ class IntegrityHFExtractor(HFExtractor):
         self.diag_slot=slot
         return super()._capture_locked(tokens,slot)
 
-    def _publish(self,tokens,slot,tensors,copied,events,path,index):
+    def _publish(self,tokens,slot,capture,path,index):
         oracle=self.oracles.pop(slot)
         occupied=2-len(self.pool.free)
         time.sleep(.5)
-        result=super()._publish(tokens,slot,tensors,copied,events,path,index)
+        result=super()._publish(tokens,slot,capture,path,index)
         saved=load_file(result['path'])
         exact=torch.equal(saved['token_ids'],tokens) and all(torch.equal(saved[k],v) for k,v in oracle.items())
         if not exact: raise RuntimeError('Transformers asynchronous transfer/persistence mismatch')
