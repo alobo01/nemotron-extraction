@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 from torch import nn
 from .hooks import install
-from .transport import BufferPool, finish_copy, publish
+from .transport import BufferPool, MEMORY_KEYS, capture_seconds, finish_copy, memory_peaks, publish, timeline
 from .types import ActivationBatch, validate_publication_threads, validate_sites, validate_tokens
 
 
@@ -169,19 +169,13 @@ class HFExtractor:
                         values[key].copy_(source.reshape(values[key].shape), non_blocking=True)
                         source.record_stream(self.copy_stream)
                     copy_end.record()
-                copied = self.copy_worker.submit(finish_copy, copy_end, copy_start, copy_end, sources)
+                copied = self.copy_worker.submit(finish_copy, copy_start, copy_end, sources)
                 copied.copy_events = (copy_start, copy_end)
-                free, total = torch.cuda.mem_get_info(self.device)
-                self.peak_gpu_memory_bytes = max(self.peak_gpu_memory_bytes, torch.cuda.max_memory_allocated(self.device))
-                self.peak_gpu_reserved_bytes = max(self.peak_gpu_reserved_bytes, torch.cuda.max_memory_reserved(self.device))
-                self.peak_device_memory_bytes = max(self.peak_device_memory_bytes, total - free)
-                self.total_device_memory_bytes = max(self.total_device_memory_bytes, total)
-                self.peak_device_memory_fraction = max(
-                    self.peak_device_memory_fraction, (total - free) / total if total else 0.0)
+                self.__dict__.update(memory_peaks({key: getattr(self, key) for key in MEMORY_KEYS}, self.device))
             else:
                 for key, source in sources.items():
                     values[key].copy_(source.reshape(values[key].shape))
-                copied = self.copy_worker.submit(finish_copy, None, None, None, sources)
+                copied = self.copy_worker.submit(finish_copy, None, None, sources)
             self.actual_forward_batches.append(len(tokens))
             copied.capture_events = tuple(self.capture_events)
             return values, copied, events
@@ -206,13 +200,9 @@ class HFExtractor:
                 self.validation_seconds += receipt["validation_seconds"]
                 self.serialization_seconds += receipt["serialization_seconds"]
             receipt.update(index=index, tokens=tokens.numel())
-            receipt['capture_seconds'] = (sum(a.elapsed_time(b)/1000 for _,a,b in copied.capture_events)
-                                          if self.diagnostics else None)
-            receipt["timeline"] = []
-            if events:
-                for name, pair in (("forward", events), ("D2H", copied.copy_events)):
-                    receipt["timeline"].append({"name": name, "start": self.origin.elapsed_time(pair[0]) / 1000,
-                                                "end": self.origin.elapsed_time(pair[1]) / 1000})
+            receipt["capture_seconds"] = capture_seconds(copied.capture_events) if self.diagnostics else None
+            receipt["timeline"] = (timeline(self.origin, (("forward", [events]), ("D2H", [copied.copy_events])))
+                                   if events else [])
             receipt["timeline"].append({"name": "write", "start": write_start,
                                         "end": time.perf_counter() - self.origin_cpu})
             return receipt

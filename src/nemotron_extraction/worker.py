@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 import torch
 from .hooks import install
-from .transport import BufferPool, finish_copy, publish
+from .transport import BufferPool, capture_seconds, finish_copy, memory_peaks, publish, seconds, timeline
 from .types import HookSite, validate_publication_threads
 
 
@@ -77,9 +77,7 @@ class ActivationHookExtension:
                           "covered": set(), "forward_events": [], "forward_batches": [],
                           "copy_events": [], "origin": self.nh_origin,
                           "scheduler": [], "diagnostics": self.nh_diagnostics,
-                          "capture_events": [],
-                          "origin_cpu": self.nh_origin_cpu,
-                          "device_peak": 0, "device_total": 0, "reserved_peak": 0}
+                          "capture_events": [], "origin_cpu": self.nh_origin_cpu, "memory": {}}
         return True
 
     def _nh_inputs(self, module, args, kwargs):
@@ -150,17 +148,10 @@ class ActivationHookExtension:
                     host[index * length:(index + 1) * length].copy_(source[start:stop], non_blocking=True)
                 source.record_stream(self.nh_stream)
             ended.record()
-        wave["copies"].append(self.nh_copy.submit(finish_copy, ended, started, ended, captured))
+        wave["copies"].append(self.nh_copy.submit(finish_copy, started, ended, captured))
         wave["copy_events"].append((started, ended))
         if self.nh_diagnostics:
-            self._nh_memory(wave)
-
-    @staticmethod
-    def _nh_memory(wave):
-        free, total = torch.cuda.mem_get_info()
-        wave["device_peak"] = max(wave["device_peak"], total - free)
-        wave["device_total"] = max(wave["device_total"], total)
-        wave["reserved_peak"] = max(wave["reserved_peak"], torch.cuda.max_memory_reserved())
+            wave["memory"] = memory_peaks(wave["memory"])
 
     def nh_seal(self, wave_id):
         wave = self.nh_active
@@ -168,8 +159,7 @@ class ActivationHookExtension:
             raise RuntimeError("Unknown capture wave")
         if len(wave["covered"]) != len(wave["tokens"]):
             raise RuntimeError("Missing prompt activations")
-        self._nh_memory(wave)
-        wave["allocated_peak"] = torch.cuda.max_memory_allocated()
+        wave["memory"] = memory_peaks(wave["memory"])
         wave["topology"] = {key: dict(value) for key, value in self.nh_topology.items()}
         self.nh_pending[wave_id] = (wave["slot"], self.nh_writer.submit(self._nh_publish, wave))
         self.nh_active = None
@@ -178,26 +168,16 @@ class ActivationHookExtension:
     @staticmethod
     def _nh_publish(wave):
         copy_seconds = sum(copy.result() for copy in wave["copies"])
-        forward_seconds = sum(start.elapsed_time(end) / 1000 for start, end in wave["forward_events"])
+        forward_seconds = sum(seconds(start, end) for start, end in wave["forward_events"])
         write_start = time.perf_counter() - wave["origin_cpu"]
         receipt = publish(wave["tensors"], wave["path"], {"wave_id": wave["id"]})
-        receipt.update(wave_id=wave["id"], tokens=wave["tokens"].numel(),
-                       capture_seconds=(sum(a.elapsed_time(b)/1000 for _,a,b in wave["capture_events"])
-                                        if wave["diagnostics"] else None),
+        receipt.update(wave["memory"], wave_id=wave["id"], tokens=wave["tokens"].numel(),
+                       capture_seconds=capture_seconds(wave["capture_events"]) if wave["diagnostics"] else None,
                        worker_copy_seconds=copy_seconds, worker_forward_seconds=forward_seconds,
                        actual_forward_batches=wave["forward_batches"], topology=wave["topology"],
-                       scheduler=wave["scheduler"], diagnostics=wave["diagnostics"],
-                       peak_gpu_memory_bytes=wave["allocated_peak"],
-                       peak_gpu_reserved_bytes=wave["reserved_peak"],
-                       peak_device_memory_bytes=wave["device_peak"],
-                       total_device_memory_bytes=wave["device_total"],
-                       peak_device_memory_fraction=(wave["device_peak"] / wave["device_total"]
-                                                    if wave["device_total"] else 0.0))
-        receipt["timeline"] = [
-            {"name": name, "start": wave["origin"].elapsed_time(start) / 1000,
-             "end": wave["origin"].elapsed_time(end) / 1000}
-            for name, events in (("forward", wave["forward_events"]), ("D2H", wave["copy_events"]))
-            for start, end in events]
+                       scheduler=wave["scheduler"], diagnostics=wave["diagnostics"])
+        receipt["timeline"] = timeline(wave["origin"], (("forward", wave["forward_events"]),
+                                                        ("D2H", wave["copy_events"])))
         receipt["timeline"].append({"name": "write", "start": write_start,
                                     "end": time.perf_counter() - wave["origin_cpu"]})
         return receipt

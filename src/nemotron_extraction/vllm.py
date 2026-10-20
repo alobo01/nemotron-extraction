@@ -9,6 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 import torch
 from safetensors.torch import load_file
+from .transport import MEMORY_KEYS
 from .types import ActivationBatch, validate_publication_threads, validate_sites, validate_tokens
 
 
@@ -98,8 +99,7 @@ class VLLMExtractor:
             self.serialization_seconds += receipt["serialization_seconds"]
             self.worker_forward_seconds += receipt["worker_forward_seconds"]
             self.actual_forward_batches.extend(receipt["actual_forward_batches"])
-            for name in ("peak_gpu_memory_bytes", "peak_gpu_reserved_bytes", "peak_device_memory_bytes",
-                         "total_device_memory_bytes", "peak_device_memory_fraction"):
+            for name in MEMORY_KEYS:
                 setattr(self, name, max(getattr(self, name), receipt[name]))
         return ready
 
