@@ -69,7 +69,10 @@ def representative_sites(model: nn.Module) -> list[HookSite]:
 def argument(args, kwargs, index, name):
     return kwargs[name] if name in kwargs else args[index]
 
-def residual(hidden: torch.Tensor, running: torch.Tensor | None) -> torch.Tensor:
+def tensor_output(output):
+    return output[0] if isinstance(output, tuple) else output
+
+def residual(hidden: torch.Tensor, running: torch.Tensor | None = None) -> torch.Tensor:
     return hidden.detach().clone() if running is None else (hidden + running).detach()
 
 def install(model, sites, captured, *, worker=False, capture_events=None):
@@ -83,38 +86,26 @@ def install(model, sites, captured, *, worker=False, capture_events=None):
         event.record()
         return event
 
-    def finish(site, event):
+    def store(site, value, running=None):
+        event = start(value)
+        captured[site.key] = residual(value, running)
         if event is not None:
             ended = torch.cuda.Event(enable_timing=True)
             ended.record()
             capture_events.append((site.key, event, ended))
 
     def pre(site, module, args, kwargs):
+        # vLLM decoder layers receive (positions, hidden_states, residual).
         if worker and site.kind == "resid_pre":
-            event = start(argument(args, kwargs, 1, "hidden_states"))
-            value = residual(argument(args, kwargs, 1, "hidden_states"),
-                             argument(args, kwargs, 2, "residual"))
-            captured[site.key] = value
-            finish(site, event)
-            return
+            store(site, argument(args, kwargs, 1, "hidden_states"), argument(args, kwargs, 2, "residual"))
         else:
-            value = argument(args, kwargs, 0, "hidden_states")
-        event = start(value)
-        captured[site.key] = value.detach().clone()
-        finish(site, event)
+            store(site, argument(args, kwargs, 0, "hidden_states"))
 
     def post(site, module, args, output):
         if worker and site.kind == "resid_post":
-            event = start(output[0])
-            value = residual(*output)
-            captured[site.key] = value
-            finish(site, event)
-            return
+            store(site, *output)
         else:
-            value = output[0] if isinstance(output, tuple) else output
-        event = start(value)
-        captured[site.key] = value.detach().clone()
-        finish(site, event)
+            store(site, tensor_output(output))
 
     try:
         for site in sites:
