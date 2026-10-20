@@ -1,12 +1,15 @@
 """Exercise worker protocol and row identity with a CPU CUDA-event stand-in."""
+
 import time
-from contextlib import nullcontext
 from concurrent.futures import Future
+from contextlib import nullcontext
 from types import SimpleNamespace
+
 import pytest
 import torch
-from torch import nn
 from safetensors.torch import load_file
+from torch import nn
+
 from nemotron_extraction.transport import BufferPool
 from nemotron_extraction.worker import ActivationHookExtension
 
@@ -14,12 +17,16 @@ from nemotron_extraction.worker import ActivationHookExtension
 class Event:
     def __init__(self, **kwargs):
         pass
+
     def record(self):
         pass
+
     def synchronize(self):
         pass
+
     def elapsed_time(self, other):
-        return 1.
+        return 1.0
+
     def wait_stream(self, stream):
         pass
 
@@ -34,6 +41,7 @@ class WorkerModel(nn.Module):
         super().__init__()
         self.model = nn.Module()
         self.model.layers = nn.ModuleList([SplitBlock()])
+
     def forward(self, input_ids, positions):
         hidden = input_ids.float().unsqueeze(1)
         return self.model.layers[0](positions, hidden, torch.ones_like(hidden))
@@ -52,8 +60,11 @@ def worker(monkeypatch, tmp_path):
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 123)
     monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda: 123)
     original = BufferPool.tensor
-    monkeypatch.setattr(BufferPool, "tensor", lambda self, slot, key, shape, dtype, **kw:
-                        original(self, slot, key, shape, dtype, pinned=False))
+    monkeypatch.setattr(
+        BufferPool,
+        "tensor",
+        lambda self, slot, key, shape, dtype, **kw: original(self, slot, key, shape, dtype, pinned=False),
+    )
     instance = ActivationHookExtension()
     instance.model_runner = SimpleNamespace(model=WorkerModel())
     instance.nh_install([{"layer": 0, "kind": "resid_pre"}, {"layer": 0, "kind": "resid_post"}], str(tmp_path))
@@ -64,8 +75,8 @@ def worker(monkeypatch, tmp_path):
 
 def forward(worker, request_ids, rows, computed=None):
     worker.model_runner.input_batch = SimpleNamespace(
-        req_ids=request_ids, token_ids_cpu=torch.tensor(rows),
-        num_computed_tokens_cpu=computed or [0] * len(rows))
+        req_ids=request_ids, token_ids_cpu=torch.tensor(rows), num_computed_tokens_cpu=computed or [0] * len(rows)
+    )
     length = len(rows[0])
     worker.model_runner.query_start_loc = SimpleNamespace(cpu=torch.arange(len(rows) + 1) * length)
     worker.model_runner.model(torch.tensor(rows).flatten(), torch.arange(length).repeat(len(rows)))
@@ -77,7 +88,7 @@ def poll(worker):
         receipts = worker.nh_poll()
         if receipts:
             return receipts
-        time.sleep(.005)
+        time.sleep(0.005)
     raise AssertionError("Writer did not finish")
 
 
@@ -94,7 +105,7 @@ def test_request_order_duplicates_and_internal_suffix(worker, tmp_path):
     assert receipt["actual_forward_batches"] == [3]
     assert receipt["peak_device_memory_bytes"] == 20
     assert receipt["total_device_memory_bytes"] == 100
-    assert receipt["peak_device_memory_fraction"] == pytest.approx(.2)
+    assert receipt["peak_device_memory_fraction"] == pytest.approx(0.2)
     assert sorted(worker.nh_pool.free) == [0, 1]
 
 
@@ -117,24 +128,28 @@ def test_unknown_request_and_partial_prefill_are_rejected(worker, tmp_path):
         forward(worker, ["a"], [[1, 2]], computed=[1])
 
 
-def test_detailed_token_validation_is_opt_in_but_scheduler_checks_remain(worker,tmp_path):
-    worker.nh_diagnostics=True
-    worker.nh_begin('tokens',['a'],[[1,2]],str(tmp_path/'tokens.safetensors'))
-    with pytest.raises(RuntimeError,match='token IDs differ'):
-        forward(worker,['a'],[[2,1]])
-    assert not worker.nh_active['covered']
+def test_detailed_token_validation_is_opt_in_but_scheduler_checks_remain(worker, tmp_path):
+    worker.nh_diagnostics = True
+    worker.nh_begin("tokens", ["a"], [[1, 2]], str(tmp_path / "tokens.safetensors"))
+    with pytest.raises(RuntimeError, match="token IDs differ"):
+        forward(worker, ["a"], [[2, 1]])
+    assert not worker.nh_active["covered"]
 
 
-def test_fast_path_does_not_read_per_token_cpu_content(worker,tmp_path):
+def test_fast_path_does_not_read_per_token_cpu_content(worker, tmp_path):
     class SchedulerTokens:
-        def __getitem__(self,key):
-            raise AssertionError('Detailed token-content access on fast path')
-    worker.nh_begin('fast',['a'],[[1,2]],str(tmp_path/'fast.safetensors'))
-    worker.model_runner.input_batch=SimpleNamespace(req_ids=['a'],
-        token_ids_cpu=SchedulerTokens(),num_computed_tokens_cpu=[0])
-    worker.model_runner.query_start_loc=SimpleNamespace(cpu=torch.tensor([0,2]))
-    worker.model_runner.model(torch.tensor([1,2]),torch.tensor([0,1]))
-    worker.nh_seal('fast')
-    r=poll(worker)[0]
-    assert r['scheduler']==[dict(request_id='a',sequence_index=0,start=0,stop=2,computed_tokens=0,prompt_length=2)]
-    assert r['validation_seconds']>=0 and r['serialization_seconds']>=0
+        def __getitem__(self, key):
+            raise AssertionError("Detailed token-content access on fast path")
+
+    worker.nh_begin("fast", ["a"], [[1, 2]], str(tmp_path / "fast.safetensors"))
+    worker.model_runner.input_batch = SimpleNamespace(
+        req_ids=["a"], token_ids_cpu=SchedulerTokens(), num_computed_tokens_cpu=[0]
+    )
+    worker.model_runner.query_start_loc = SimpleNamespace(cpu=torch.tensor([0, 2]))
+    worker.model_runner.model(torch.tensor([1, 2]), torch.tensor([0, 1]))
+    worker.nh_seal("fast")
+    r = poll(worker)[0]
+    assert r["scheduler"] == [
+        dict(request_id="a", sequence_index=0, start=0, stop=2, computed_tokens=0, prompt_length=2)
+    ]
+    assert r["validation_seconds"] >= 0 and r["serialization_seconds"] >= 0

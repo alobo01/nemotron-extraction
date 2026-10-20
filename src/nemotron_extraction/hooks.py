@@ -1,9 +1,14 @@
 """Shared Nemotron topology and capture semantics, adapted from nemotron-sae."""
+
 from __future__ import annotations
+
 from functools import partial
+
 import torch
 from torch import nn
-from .types import HookSite, KINDS
+
+from .types import KINDS, HookSite
+
 
 def layers_of(model: nn.Module):
     for path in ("model.layers", "backbone.layers", "layers"):
@@ -15,6 +20,7 @@ def layers_of(model: nn.Module):
             continue
     raise ValueError("Unsupported topology: expected Nemotron decoder layers")
 
+
 def mixer_kind(mixer: nn.Module) -> str | None:
     name = type(mixer).__name__.lower()
     if "mamba" in name or "ssm" in name:
@@ -25,12 +31,14 @@ def mixer_kind(mixer: nn.Module) -> str | None:
         return "moe_out"
     return None
 
+
 def projection_of(mixer: nn.Module) -> tuple[str, nn.Module]:
     for name in ("o_proj", "out_proj", "dense"):
         projection = getattr(mixer, name, None)
         if isinstance(projection, nn.Module):
             return name, projection
     raise ValueError(f"Cannot locate attention output projection in {type(mixer).__name__}")
+
 
 def resolve(model: nn.Module, site: HookSite) -> tuple[str, nn.Module]:
     path, layers = layers_of(model)
@@ -49,6 +57,7 @@ def resolve(model: nn.Module, site: HookSite) -> tuple[str, nn.Module]:
         return f"{path}.mixer.{name}", projection
     return f"{path}.mixer", mixer
 
+
 def representative_sites(model: nn.Module) -> list[HookSite]:
     _, layers = layers_of(model)
     result = []
@@ -66,14 +75,18 @@ def representative_sites(model: nn.Module) -> list[HookSite]:
             result.append(HookSite(layer, kind))
     return result
 
+
 def argument(args, kwargs, index, name):
     return kwargs[name] if name in kwargs else args[index]
+
 
 def tensor_output(output):
     return output[0] if isinstance(output, tuple) else output
 
+
 def residual(hidden: torch.Tensor, running: torch.Tensor | None = None) -> torch.Tensor:
     return hidden.detach().clone() if running is None else (hidden + running).detach()
+
 
 def repair_time_step_limits(model: nn.Module) -> None:
     """Decode JSON-serialized float limits in remote Nemotron configs; values are unchanged."""
@@ -81,8 +94,9 @@ def repair_time_step_limits(model: nn.Module) -> None:
         limit = getattr(module, "time_step_limit", None)
         if isinstance(limit, (tuple, list)) and len(limit) == 2:
             module.time_step_limit = tuple(
-                float(item["__float__"]) if isinstance(item, dict) and "__float__" in item else item
-                for item in limit)
+                float(item["__float__"]) if isinstance(item, dict) and "__float__" in item else item for item in limit
+            )
+
 
 def install(model, sites, captured, *, worker=False, capture_events=None):
     """Capture detached GPU copies; callers move them only after the forward pass."""
@@ -120,9 +134,11 @@ def install(model, sites, captured, *, worker=False, capture_events=None):
         for site in sites:
             path, module = resolve(model, site)
             topology[site.key] = {"layer": site.layer, "kind": site.kind, "module_path": path}
-            handle = (module.register_forward_pre_hook(partial(pre, site), with_kwargs=True)
-                      if site.kind in ("resid_pre", "attn_out_prelinear")
-                      else module.register_forward_hook(partial(post, site)))
+            handle = (
+                module.register_forward_pre_hook(partial(pre, site), with_kwargs=True)
+                if site.kind in ("resid_pre", "attn_out_prelinear")
+                else module.register_forward_hook(partial(post, site))
+            )
             handles.append(handle)
     except Exception:
         for handle in handles:

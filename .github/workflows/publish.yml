@@ -25,6 +25,10 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           python-version: "3.12"
+      - name: Lint and format check
+        run: |
+          uvx ruff@0.9.4 check src benchmarks tests
+          uvx ruff@0.9.4 format --check src benchmarks tests
       - name: Run tests
         run: uv run --locked --group dev pytest -q
       - name: Verify release version

@@ -10,25 +10,37 @@ When one job cannot finish a language, run a pilot with `run --tokens 16384` int
 <pilot>/<lang>-0, split the full run with `plan --pilot <pilot>`, run each range with
 `run --start/--tokens`, and join the ranges with `aggregate`.
 """
+
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import torch
-from safetensors.torch import load_file, save_file
-from nemotron_extraction import HFExtractor, VLLMExtractor, HookSite
-from nemotron_extraction.hooks import representative_sites
-
-from benchlib.common import (DATA, MODEL, MODEL_REVISION, batches, digest as sha256, job_minutes,
-                             load_tokens, versions, write_json)
+from benchlib.common import (
+    DATA,
+    MODEL,
+    MODEL_REVISION,
+    batches,
+    job_minutes,
+    load_tokens,
+    versions,
+    write_json,
+)
+from benchlib.common import (
+    digest as sha256,
+)
 from benchlib.stats import Agreement, normalized_mse
+from safetensors.torch import load_file, save_file
+
+from nemotron_extraction import HFExtractor, HookSite, VLLMExtractor
+from nemotron_extraction.hooks import representative_sites
 
 TOKENS_PER_LANGUAGE = 1_000_000
 BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128)
@@ -38,19 +50,30 @@ def prepare(args):
     from datasets import load_dataset
     from huggingface_hub import HfApi, snapshot_download
     from transformers import AutoTokenizer
+
     root = args.work
     root.mkdir(parents=True, exist_ok=True)
     api = HfApi()
     revision = api.model_info(MODEL, revision=args.revision).sha
-    model = snapshot_download(MODEL, revision=revision,
-                              allow_patterns=["*.json", "*.py", "*.safetensors", "*.txt", "*.model"])
+    model = snapshot_download(
+        MODEL, revision=revision, allow_patterns=["*.json", "*.py", "*.safetensors", "*.txt", "*.model"]
+    )
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     if tokenizer.eos_token_id is None:
         raise ValueError("An EOS token is required for document boundaries")
-    manifest = {"model": MODEL, "model_revision": revision, "model_path": model,
-                "tokenizer_revision": revision, "sequence_length": 2048, "tokens_per_language": TOKENS_PER_LANGUAGE,
-                "dtype": "bfloat16", "seed": 42, "document_order": "dataset iteration order; no shuffle",
-                "languages": {}, "software": versions()}
+    manifest = {
+        "model": MODEL,
+        "model_revision": revision,
+        "model_path": model,
+        "tokenizer_revision": revision,
+        "sequence_length": 2048,
+        "tokens_per_language": TOKENS_PER_LANGUAGE,
+        "dtype": "bfloat16",
+        "seed": 42,
+        "document_order": "dataset iteration order; no shuffle",
+        "languages": {},
+        "software": versions(),
+    }
     for language, (dataset, config) in DATA.items():
         data_revision = api.dataset_info(dataset).sha
         stream = load_dataset(dataset, config, revision=data_revision, split="train", streaming=True)
@@ -68,9 +91,15 @@ def prepare(args):
             raise ValueError(f"Insufficient {language} tokens")
         path = root / f"{language}.safetensors"
         save_file({"token_ids": torch.tensor(tokens[:TOKENS_PER_LANGUAGE], dtype=torch.long)}, str(path))
-        manifest["languages"][language] = {"dataset": dataset, "config": config, "revision": data_revision,
-                                           "split": "train", "documents": documents,
-                                           "document_order_sha256": order.hexdigest(), "token_sha256": sha256(path)}
+        manifest["languages"][language] = {
+            "dataset": dataset,
+            "config": config,
+            "revision": data_revision,
+            "split": "train",
+            "documents": documents,
+            "document_order_sha256": order.hexdigest(),
+            "token_sha256": sha256(path),
+        }
         print(f"prepared {language}: 1,000,000 tokens", flush=True)
     write_json(root / "manifest.json", manifest)
 
@@ -83,7 +112,7 @@ def backend(args):
     stop = min(args.start + args.tokens, all_tokens.numel())
     if args.start < 0 or args.start % 2048 or args.start >= stop or stop - args.start != args.tokens:
         raise ValueError("Invalid token range")
-    tokens = all_tokens[args.start:stop]
+    tokens = all_tokens[args.start : stop]
     run = args.output
     reference_dir = run / "reference"
     reference_dir.mkdir(parents=True, exist_ok=True)
@@ -91,9 +120,15 @@ def backend(args):
     started = time.perf_counter()
     if args.backend == "hf":
         from transformers import AutoModelForCausalLM
+
         phase = time.perf_counter()
-        model = AutoModelForCausalLM.from_pretrained(manifest["model_path"], torch_dtype=torch.bfloat16,
-                                                   device_map="cuda", trust_remote_code=True, local_files_only=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            manifest["model_path"],
+            torch_dtype=torch.bfloat16,
+            device_map="cuda",
+            trust_remote_code=True,
+            local_files_only=True,
+        )
         model_load_seconds = time.perf_counter() - phase
         phase = time.perf_counter()
         sites = representative_sites(model)
@@ -102,27 +137,40 @@ def backend(args):
         write_json(sites_file, [{"layer": site.layer, "kind": site.kind} for site in sites])
     else:
         sites = [HookSite(**site) for site in json.loads(sites_file.read_text())]
-        extractor = VLLMExtractor(manifest["model_path"], sites, sequences_per_call=args.batch_size,
-                                  max_model_len=2049, sink_dir=os.environ.get("NH_SINK_DIR"),
-                                  gpu_memory_utilization=float(os.environ.get("NH_GPU_MEMORY_UTILIZATION", "0.96")),
-                                  kv_cache_memory_bytes=None)
+        extractor = VLLMExtractor(
+            manifest["model_path"],
+            sites,
+            sequences_per_call=args.batch_size,
+            max_model_len=2049,
+            sink_dir=os.environ.get("NH_SINK_DIR"),
+            gpu_memory_utilization=float(os.environ.get("NH_GPU_MEMORY_UTILIZATION", "0.96")),
+            kv_cache_memory_bytes=None,
+        )
         model_load_seconds = extractor.engine_startup_seconds
         hook_install_seconds = extractor.hook_install_seconds
     startup = model_load_seconds + hook_install_seconds
-    print(f"{args.backend} ready: model/engine {model_load_seconds:.1f}s, hooks {hook_install_seconds:.1f}s", flush=True)
-    extraction, comparison, persistence, count = 0., 0., 0., 0
+    print(
+        f"{args.backend} ready: model/engine {model_load_seconds:.1f}s, hooks {hook_install_seconds:.1f}s", flush=True
+    )
+    extraction, comparison, persistence, count = 0.0, 0.0, 0.0, 0
     stats = {site.key: Agreement() for site in sites}
     torch.cuda.reset_peak_memory_stats()
     with extractor:
         # Warmup has no effect on counted tokens or recorded samples.
         torch.cuda.synchronize()
         phase = time.perf_counter()
-        extractor.extract(tokens[:min(128, len(tokens))].unsqueeze(0))
+        extractor.extract(tokens[: min(128, len(tokens))].unsqueeze(0))
         torch.cuda.synchronize()
         warmup_seconds = time.perf_counter() - phase
-        timing_names = ("model_forward_seconds", "cpu_copy_seconds", "generate_seconds",
-                        "worker_collection_seconds", "driver_read_seconds", "worker_copy_seconds",
-                        "worker_write_seconds")
+        timing_names = (
+            "model_forward_seconds",
+            "cpu_copy_seconds",
+            "generate_seconds",
+            "worker_collection_seconds",
+            "driver_read_seconds",
+            "worker_copy_seconds",
+            "worker_write_seconds",
+        )
         timing_before = {name: getattr(extractor, name, 0.0) for name in timing_names}
         for index, batch in enumerate(batches(tokens, args.batch_size, 2048)):
             torch.cuda.synchronize()
@@ -146,7 +194,10 @@ def backend(args):
                 for key, value in result.activations.items():
                     stats[key].add(reference[key], value)
                     if index == 0:
-                        save_file({"hf": reference[key][:8].clone(), "vllm": value[:8].clone()}, str(run / f"sample-{key}.safetensors"))
+                        save_file(
+                            {"hf": reference[key][:8].clone(), "vllm": value[:8].clone()},
+                            str(run / f"sample-{key}.safetensors"),
+                        )
                 del reference
                 comparison += time.perf_counter() - begin
             count += batch.numel()
@@ -154,32 +205,58 @@ def backend(args):
                 print(f"{args.backend}: {count}/{args.tokens} tokens", flush=True)
         topology = extractor.topology
         peak = max(torch.cuda.max_memory_allocated(), getattr(extractor, "peak_gpu_memory_bytes", 0))
-    receipt = {"backend": args.backend, "language": args.language, "tokens": count,
-               "start_token": args.start, "batch_size": args.batch_size, "sequence_length": 2048,
-               "model_load_seconds": model_load_seconds, "hook_install_seconds": hook_install_seconds,
-               "startup_seconds": startup, "warmup_seconds": warmup_seconds,
-               "inference_seconds": (getattr(extractor, "model_forward_seconds", 0.0) - timing_before["model_forward_seconds"]
-                                     if args.backend == "hf" else extractor.generate_seconds - timing_before["generate_seconds"]),
-               "capture_copy_seconds": (getattr(extractor, "cpu_copy_seconds", 0.0) - timing_before["cpu_copy_seconds"]
-                                        if args.backend == "hf" else extractor.worker_copy_seconds - timing_before["worker_copy_seconds"]),
-               "worker_write_seconds": (extractor.worker_write_seconds - timing_before["worker_write_seconds"]
-                                        if args.backend == "vllm" else 0.0),
-               "worker_collection_seconds": (extractor.worker_collection_seconds - timing_before["worker_collection_seconds"]
-                                              if args.backend == "vllm" else 0.0),
-               "driver_read_seconds": getattr(extractor, "driver_read_seconds", 0.0) - timing_before["driver_read_seconds"],
-               "extraction_seconds": extraction,
-               "comparison_seconds": comparison, "persistence_seconds": persistence,
-               "wall_seconds": time.perf_counter() - started, "tokens_per_second": count / extraction,
-               "peak_gpu_memory_bytes": peak, "topology": topology, "software": versions(),
-               "gpu_memory_utilization": (extractor.gpu_memory_utilization if args.backend == "vllm" else None),
-               "kv_cache_memory_bytes": (extractor.kv_cache_memory_bytes if args.backend == "vllm" else None),
-               "cuda_graphs_enabled": False,
-               "gpu": torch.cuda.get_device_name(),
-               "source": {"model": manifest["model"], "model_revision": manifest["model_revision"],
-                          "tokenizer_revision": manifest["tokenizer_revision"], "dataset": data,
-                          "dtype": manifest["dtype"]},
-               "manifest_sha256": sha256(args.work / "manifest.json"),
-               "script_sha256": sha256(__file__)}
+    receipt = {
+        "backend": args.backend,
+        "language": args.language,
+        "tokens": count,
+        "start_token": args.start,
+        "batch_size": args.batch_size,
+        "sequence_length": 2048,
+        "model_load_seconds": model_load_seconds,
+        "hook_install_seconds": hook_install_seconds,
+        "startup_seconds": startup,
+        "warmup_seconds": warmup_seconds,
+        "inference_seconds": (
+            getattr(extractor, "model_forward_seconds", 0.0) - timing_before["model_forward_seconds"]
+            if args.backend == "hf"
+            else extractor.generate_seconds - timing_before["generate_seconds"]
+        ),
+        "capture_copy_seconds": (
+            getattr(extractor, "cpu_copy_seconds", 0.0) - timing_before["cpu_copy_seconds"]
+            if args.backend == "hf"
+            else extractor.worker_copy_seconds - timing_before["worker_copy_seconds"]
+        ),
+        "worker_write_seconds": (
+            extractor.worker_write_seconds - timing_before["worker_write_seconds"] if args.backend == "vllm" else 0.0
+        ),
+        "worker_collection_seconds": (
+            extractor.worker_collection_seconds - timing_before["worker_collection_seconds"]
+            if args.backend == "vllm"
+            else 0.0
+        ),
+        "driver_read_seconds": getattr(extractor, "driver_read_seconds", 0.0) - timing_before["driver_read_seconds"],
+        "extraction_seconds": extraction,
+        "comparison_seconds": comparison,
+        "persistence_seconds": persistence,
+        "wall_seconds": time.perf_counter() - started,
+        "tokens_per_second": count / extraction,
+        "peak_gpu_memory_bytes": peak,
+        "topology": topology,
+        "software": versions(),
+        "gpu_memory_utilization": (extractor.gpu_memory_utilization if args.backend == "vllm" else None),
+        "kv_cache_memory_bytes": (extractor.kv_cache_memory_bytes if args.backend == "vllm" else None),
+        "cuda_graphs_enabled": False,
+        "gpu": torch.cuda.get_device_name(),
+        "source": {
+            "model": manifest["model"],
+            "model_revision": manifest["model_revision"],
+            "tokenizer_revision": manifest["tokenizer_revision"],
+            "dataset": data,
+            "dtype": manifest["dtype"],
+        },
+        "manifest_sha256": sha256(args.work / "manifest.json"),
+        "script_sha256": sha256(__file__),
+    }
     if args.backend == "vllm":
         receipt["agreement"] = {key: value.result() for key, value in stats.items()}
         receipt["passed"] = all(value["passed"] for value in receipt["agreement"].values())
@@ -196,8 +273,20 @@ def run(args):
     args.output.mkdir(parents=True, exist_ok=True)
     if (args.output / "vllm.json").exists() or (args.output / "hf.json").exists():
         raise ValueError("Use a new output directory; completed receipts are immutable")
-    common = ["--work", str(args.work), "--output", str(args.output), "--language", args.language,
-              "--tokens", str(args.tokens), "--start", str(args.start), "--batch-size", str(args.batch_size)]
+    common = [
+        "--work",
+        str(args.work),
+        "--output",
+        str(args.output),
+        "--language",
+        args.language,
+        "--tokens",
+        str(args.tokens),
+        "--start",
+        str(args.start),
+        "--batch-size",
+        str(args.batch_size),
+    ]
     for engine in ("hf", "vllm"):
         command = [sys.executable, str(Path(__file__).resolve()), "backend", "--backend", engine, *common]
         if args.hf_python and engine == "hf":
@@ -211,22 +300,69 @@ def run(args):
 def report(args):
     hf = json.loads((args.output / "hf.json").read_text())
     vllm = json.loads((args.output / "vllm.json").read_text())
-    for key in ("language", "tokens", "batch_size", "start_token", "manifest_sha256",
-                "sequence_length", "script_sha256", "source", "gpu"):
+    for key in (
+        "language",
+        "tokens",
+        "batch_size",
+        "start_token",
+        "manifest_sha256",
+        "sequence_length",
+        "script_sha256",
+        "source",
+        "gpu",
+    ):
         if hf[key] != vllm[key]:
             raise ValueError(f"Backend receipts disagree on {key}")
-    result = {"hf": hf, "vllm": vllm, "passed": vllm["passed"], "speedup": vllm["tokens_per_second"] / hf["tokens_per_second"]}
+    result = {
+        "hf": hf,
+        "vllm": vllm,
+        "passed": vllm["passed"],
+        "speedup": vllm["tokens_per_second"] / hf["tokens_per_second"],
+    }
     write_json(args.output / "results.json", result)
-    lines = [f"# {hf['language']} activation validation", "", f"Tokens: {hf['tokens']:,}. Numerical gate: {'PASS' if result['passed'] else 'FAIL'}.", "",
-             "| Backend | Load s | Hooks s | Warmup s | Inference s | H2C copy s | Sink write s | Collect/read s | Full tok/s | Peak GiB |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    lines = [
+        f"# {hf['language']} activation validation",
+        "",
+        f"Tokens: {hf['tokens']:,}. Numerical gate: {'PASS' if result['passed'] else 'FAIL'}.",
+        "",
+        "| Backend | Load s | Hooks s | Warmup s | Inference s | H2C copy s "
+        "| Sink write s | Collect/read s | Full tok/s | Peak GiB |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
     for receipt in (hf, vllm):
-        lines.append(f"| {receipt['backend']} | {receipt['model_load_seconds']:.1f} | {receipt['hook_install_seconds']:.1f} | {receipt['warmup_seconds']:.1f} | {receipt['inference_seconds']:.1f} | {receipt['capture_copy_seconds']:.1f} | {receipt['worker_write_seconds']:.1f} | {receipt['worker_collection_seconds'] + receipt['driver_read_seconds']:.1f} | {receipt['tokens_per_second']:.1f} | {receipt['peak_gpu_memory_bytes'] / 2**30:.2f} |")
-    lines += ["", "Inference excludes model loading, hook setup, warmup and post-generation collection. GPU-to-host copies are shown separately; vLLM performs them inside generation. Sink writes are asynchronous and may overlap inference. Full extraction throughput measures the complete extractor call. CUDA graphs are disabled by eager execution.", "",
-              "Normalised mean squared error (MSE) scales both backends by the Hugging Face Transformers reference root mean square at each site. It equals summed squared error divided by the summed squared reference, or relative L2 squared. Numerical thresholds are unchanged.", "",
-              "| Site | Mean cosine | Minimum cosine | p01 cosine | Normalised MSE | Relative L2 | Max error | Gate |", "|---|---:|---:|---:|---:|---:|---:|---|"]
+        lines.append(
+            f"| {receipt['backend']} | {receipt['model_load_seconds']:.1f} | "
+            f"{receipt['hook_install_seconds']:.1f} | {receipt['warmup_seconds']:.1f} "
+            f"| {receipt['inference_seconds']:.1f} | {receipt['capture_copy_seconds']:.1f} "
+            f"| {receipt['worker_write_seconds']:.1f} | "
+            f"{receipt['worker_collection_seconds'] + receipt['driver_read_seconds']:.1f} "
+            f"| {receipt['tokens_per_second']:.1f} | {receipt['peak_gpu_memory_bytes'] / 2**30:.2f} "
+            "|"
+        )
+    lines += [
+        "",
+        "Inference excludes model loading, hook setup, warmup and post-generation "
+        "collection. GPU-to-host copies are shown separately; vLLM performs "
+        "them inside generation. Sink writes are asynchronous and may overlap "
+        "inference. Full extraction throughput measures the complete extractor "
+        "call. CUDA graphs are disabled by eager execution.",
+        "",
+        "Normalised mean squared error (MSE) scales both backends by the Hugging "
+        "Face Transformers reference root mean square at each site. It equals "
+        "summed squared error divided by the summed squared reference, or relative "
+        "L2 squared. Numerical thresholds are unchanged.",
+        "",
+        "| Site | Mean cosine | Minimum cosine | p01 cosine | Normalised MSE | Relative L2 | Max error | Gate |",
+        "|---|---:|---:|---:|---:|---:|---:|---|",
+    ]
     for key, value in vllm["agreement"].items():
-        nmse = normalized_mse(value['error_squared_sum'], value['reference_squared_sum'])
-        lines.append(f"| {key} | {value['mean_cosine']:.6f} | {value['minimum_cosine']:.6f} | {value['first_percentile_cosine']:.6f} | {nmse} | {value['relative_l2']} | {value['maximum_absolute_error']:.5f} | {'PASS' if value['passed'] else 'FAIL'} |")
+        nmse = normalized_mse(value["error_squared_sum"], value["reference_squared_sum"])
+        lines.append(
+            f"| {key} | {value['mean_cosine']:.6f} | {value['minimum_cosine']:.6f} "
+            f"| {value['first_percentile_cosine']:.6f} | {nmse} | {value['relative_l2']} "
+            f"| {value['maximum_absolute_error']:.5f} | {'PASS' if value['passed'] else 'FAIL'} "
+            "|"
+        )
     (args.output / "report.md").write_text("\n".join(lines) + "\n")
 
 
@@ -244,15 +380,24 @@ def run_all(args):
     for language in DATA:
         output = args.output / language
         run_args = argparse.Namespace(
-            work=args.work, output=output, language=language, tokens=TOKENS_PER_LANGUAGE,
-            start=0, batch_size=args.batch_size, hf_python=args.hf_python,
+            work=args.work,
+            output=output,
+            language=language,
+            tokens=TOKENS_PER_LANGUAGE,
+            start=0,
+            batch_size=args.batch_size,
+            hf_python=args.hf_python,
         )
         if (output / "hf.json").exists() and (output / "vllm.json").exists():
             for engine in ("hf", "vllm"):
                 receipt = json.loads((output / f"{engine}.json").read_text())
-                expected = {"language": language, "tokens": TOKENS_PER_LANGUAGE, "start_token": 0,
-                            "batch_size": args.batch_size,
-                            "manifest_sha256": sha256(args.work / "manifest.json")}
+                expected = {
+                    "language": language,
+                    "tokens": TOKENS_PER_LANGUAGE,
+                    "start_token": 0,
+                    "batch_size": args.batch_size,
+                    "manifest_sha256": sha256(args.work / "manifest.json"),
+                }
                 if any(receipt.get(key) != value for key, value in expected.items()):
                     raise ValueError(f"Completed receipts in {output} differ from this request")
             report(run_args)
@@ -278,10 +423,18 @@ def plan_ranges(pilot, batch_size):
     startup += max(pair[1]["startup_seconds"] for pair in records.values())
     for language, (hf, vllm) in records.items():
         # Wall minus startup includes warmup, cleanup, persistence and comparison.
-        fixed = max(0, hf["wall_seconds"] - hf["startup_seconds"] - hf["extraction_seconds"] - hf["persistence_seconds"])
-        fixed += max(0, vllm["wall_seconds"] - vllm["startup_seconds"] - vllm["extraction_seconds"] - vllm["comparison_seconds"])
-        per_token = (hf["extraction_seconds"] + hf["persistence_seconds"] +
-                     vllm["extraction_seconds"] + vllm["comparison_seconds"]) / 16384
+        fixed = max(
+            0, hf["wall_seconds"] - hf["startup_seconds"] - hf["extraction_seconds"] - hf["persistence_seconds"]
+        )
+        fixed += max(
+            0, vllm["wall_seconds"] - vllm["startup_seconds"] - vllm["extraction_seconds"] - vllm["comparison_seconds"]
+        )
+        per_token = (
+            hf["extraction_seconds"]
+            + hf["persistence_seconds"]
+            + vllm["extraction_seconds"]
+            + vllm["comparison_seconds"]
+        ) / 16384
         available = (3600 - 120) / 1.25 - startup - fixed
         maximum = int(available / per_token / 2048) * 2048
         if maximum < 2048:
@@ -290,8 +443,15 @@ def plan_ranges(pilot, batch_size):
         while start < TOKENS_PER_LANGUAGE:
             count = min(maximum, TOKENS_PER_LANGUAGE - start)
             minutes = job_minutes(startup + fixed + count * per_token)
-            jobs.append({"language": language, "start": start, "tokens": count,
-                         "minutes": min(60, minutes), "batch_size": batch_size})
+            jobs.append(
+                {
+                    "language": language,
+                    "start": start,
+                    "tokens": count,
+                    "minutes": min(60, minutes),
+                    "batch_size": batch_size,
+                }
+            )
             start += count
     return jobs
 
@@ -312,7 +472,20 @@ def aggregate_ranges(paths, output, expected=TOKENS_PER_LANGUAGE):
         if start != end:
             raise ValueError("Ranges must be contiguous, non-overlapping and begin at zero")
         for engine, record, baseline in (("hf", hf, first[2]), ("vllm", vllm, first[3])):
-            for key in ("language", "manifest_sha256", "batch_size", "sequence_length", "topology", "software", "script_sha256", "source", "gpu", "gpu_memory_utilization", "kv_cache_memory_bytes", "cuda_graphs_enabled"):
+            for key in (
+                "language",
+                "manifest_sha256",
+                "batch_size",
+                "sequence_length",
+                "topology",
+                "software",
+                "script_sha256",
+                "source",
+                "gpu",
+                "gpu_memory_utilization",
+                "kv_cache_memory_bytes",
+                "cuda_graphs_enabled",
+            ):
                 if record[key] != baseline[key]:
                     raise ValueError(f"Ranges disagree on {engine} {key}")
         end += hf["tokens"]
@@ -327,7 +500,19 @@ def aggregate_ranges(paths, output, expected=TOKENS_PER_LANGUAGE):
     for engine, column in (("hf", 2), ("vllm", 3)):
         result = dict(first[column])
         result.update(tokens=end, start_token=0, ranges=len(receipts))
-        for key in ("model_load_seconds", "hook_install_seconds", "startup_seconds", "warmup_seconds", "inference_seconds", "capture_copy_seconds", "driver_read_seconds", "extraction_seconds", "comparison_seconds", "persistence_seconds", "wall_seconds"):
+        for key in (
+            "model_load_seconds",
+            "hook_install_seconds",
+            "startup_seconds",
+            "warmup_seconds",
+            "inference_seconds",
+            "capture_copy_seconds",
+            "driver_read_seconds",
+            "extraction_seconds",
+            "comparison_seconds",
+            "persistence_seconds",
+            "wall_seconds",
+        ):
             result[key] = sum(row[column][key] for row in receipts)
         result["tokens_per_second"] = end / result["extraction_seconds"]
         result["peak_gpu_memory_bytes"] = max(row[column]["peak_gpu_memory_bytes"] for row in receipts)

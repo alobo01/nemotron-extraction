@@ -1,12 +1,13 @@
 """Pinned inputs, provenance and JSON receipts shared by every benchmark."""
+
 from __future__ import annotations
 
 import hashlib
 import importlib.metadata
 import json
 import math
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import torch
 from safetensors.torch import load_file
@@ -16,9 +17,11 @@ from nemotron_extraction.transport import atomic_path
 
 MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 MODEL_REVISION = "fe4143e388795a58a92974891b2e45092a53dc1d"
-DATA = {"en": ("HuggingFaceFW/fineweb-edu", "sample-10BT"),
-        "de": ("HuggingFaceFW/fineweb-2", "deu_Latn"),
-        "es": ("HuggingFaceFW/fineweb-2", "spa_Latn")}
+DATA = {
+    "en": ("HuggingFaceFW/fineweb-edu", "sample-10BT"),
+    "de": ("HuggingFaceFW/fineweb-2", "deu_Latn"),
+    "es": ("HuggingFaceFW/fineweb-2", "spa_Latn"),
+}
 SEQUENCE_LENGTH = 2048
 # First frozen English sequence, as little-endian int64 token IDs.
 ANCHOR_SHA256 = "c5e6f8311596eba310ae9c0f181334dc5d2ae8fcbd8290d7f26ce995b30fb840"
@@ -44,8 +47,18 @@ def write_json(path, value):
 
 def versions():
     result = {"python": sys.version.split()[0], "cuda": torch.version.cuda}
-    for name in ("nemotron-extraction", "torch", "transformers", "vllm", "datasets", "safetensors",
-                 "mamba-ssm", "causal-conv1d", "accelerate", "kernels"):
+    for name in (
+        "nemotron-extraction",
+        "torch",
+        "transformers",
+        "vllm",
+        "datasets",
+        "safetensors",
+        "mamba-ssm",
+        "causal-conv1d",
+        "accelerate",
+        "kernels",
+    ):
         try:
             result[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
@@ -71,8 +84,7 @@ def batches(tokens, batch_size, seq_len):
     """Full [batch, seq_len] rows of a flat token stream, then one shorter final row."""
     full = tokens.numel() // seq_len * seq_len
     if full:
-        for chunk in tokens[:full].reshape(-1, seq_len).split(batch_size):
-            yield chunk
+        yield from tokens[:full].reshape(-1, seq_len).split(batch_size)
     if full < tokens.numel():
         yield tokens[full:].unsqueeze(0)
 
@@ -85,7 +97,7 @@ def anchor_inputs(work):
     tokens = load_tokens(work, "en", manifest)
     if tokens.numel() < 64 * SEQUENCE_LENGTH:
         raise ValueError("Need the first 64 frozen English sequences")
-    return manifest, tokens[:64 * SEQUENCE_LENGTH].reshape(64, SEQUENCE_LENGTH)
+    return manifest, tokens[: 64 * SEQUENCE_LENGTH].reshape(64, SEQUENCE_LENGTH)
 
 
 def anchor_digest(rows):
@@ -94,8 +106,9 @@ def anchor_digest(rows):
 
 def is_memory_failure(error):
     message = str(error).lower()
-    return isinstance(error, torch.OutOfMemoryError) or any(text in message for text in (
-        "out of memory", "gpu memory budget", "no available memory", "kv cache blocks"))
+    return isinstance(error, torch.OutOfMemoryError) or any(
+        text in message for text in ("out of memory", "gpu memory budget", "no available memory", "kv cache blocks")
+    )
 
 
 def job_minutes(seconds):

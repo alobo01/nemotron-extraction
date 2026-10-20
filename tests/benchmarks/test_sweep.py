@@ -1,13 +1,15 @@
 import argparse
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-import torch
-from safetensors.torch import save_file
-from nemotron_extraction import HFExtractor, HookSite
-from tiny_models import Model
 
 import sweep
+import torch
 from benchlib.common import digest, write_json
+from safetensors.torch import save_file
+from tiny_models import Model
+
+from nemotron_extraction import HFExtractor, HookSite
+
 
 def test_durable_shard_resume_and_comparison(monkeypatch, tmp_path):
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "CPU test fixture")
@@ -15,8 +17,11 @@ def test_durable_shard_resume_and_comparison(monkeypatch, tmp_path):
     work.mkdir()
     path = work / "en.safetensors"
     save_file({"token_ids": torch.arange(6)}, str(path))
-    manifest = {"model_revision": "fixed", "tokenizer_revision": "fixed",
-                "languages": {"en": {"token_sha256": digest(path)}}}
+    manifest = {
+        "model_revision": "fixed",
+        "tokenizer_revision": "fixed",
+        "languages": {"en": {"token_sha256": digest(path)}},
+    }
     write_json(work / "manifest.json", manifest)
     args = argparse.Namespace(work=work, output=output, backend="hf", batch_size=8, tokens=6, profile=True)
     with HFExtractor(Model(), [HookSite(0, "resid_post")], device="cpu") as extractor:

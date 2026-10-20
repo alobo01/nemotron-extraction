@@ -1,12 +1,15 @@
 from __future__ import annotations
+
 import asyncio
 import tempfile
 import threading
 import time
 import uuid
 from dataclasses import asdict
+
 import torch
 from safetensors.torch import load_file
+
 from .extractor import Extractor
 from .transport import SLOTS
 from .types import ActivationBatch, validate_tokens
@@ -14,12 +17,26 @@ from .types import ActivationBatch, validate_tokens
 
 class VLLMExtractor(Extractor):
     """Persistent AsyncLLM workers with two in-flight capture/publication slots."""
+
     _worker_extension_cls = "nemotron_extraction.worker.ActivationHookExtension"
 
-    def __init__(self, model, sites, *, revision=None, max_model_len=2049,
-                 sequences_per_call=4, dtype="bfloat16", trust_remote_code=True,
-                 enable_chunked_prefill=False, sink_dir=None, gpu_memory_utilization=0.96,
-                 kv_cache_memory_bytes=None, diagnostics=False, publication_threads=1):
+    def __init__(
+        self,
+        model,
+        sites,
+        *,
+        revision=None,
+        max_model_len=2049,
+        sequences_per_call=4,
+        dtype="bfloat16",
+        trust_remote_code=True,
+        enable_chunked_prefill=False,
+        sink_dir=None,
+        gpu_memory_utilization=0.96,
+        kv_cache_memory_bytes=None,
+        diagnostics=False,
+        publication_threads=1,
+    ):
         super().__init__(sites, diagnostics, publication_threads)
         if sequences_per_call < 1 or max_model_len < 2 or not 0 < gpu_memory_utilization <= 1:
             raise ValueError("Invalid sequence batch size, model length or memory utilization")
@@ -49,25 +66,37 @@ class VLLMExtractor(Extractor):
     async def _start(self, model, revision, dtype, trust_remote_code):
         from vllm import AsyncEngineArgs, SamplingParams
         from vllm.v1.engine.async_llm import AsyncLLM
+
         self.lock = asyncio.Lock()
         started = time.perf_counter()
         args = AsyncEngineArgs(
-            model=model, revision=revision, tokenizer_revision=revision, dtype=dtype,
-            trust_remote_code=trust_remote_code, tensor_parallel_size=1, enforce_eager=True,
-            enable_prefix_caching=False, enable_chunked_prefill=self.enable_chunked_prefill,
+            model=model,
+            revision=revision,
+            tokenizer_revision=revision,
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+            tensor_parallel_size=1,
+            enforce_eager=True,
+            enable_prefix_caching=False,
+            enable_chunked_prefill=self.enable_chunked_prefill,
             skip_tokenizer_init=True,
-            max_model_len=self.max_model_len, max_num_seqs=self.sequences_per_call,
+            max_model_len=self.max_model_len,
+            max_num_seqs=self.sequences_per_call,
             max_num_batched_tokens=self.sequences_per_call * self.max_model_len,
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
-            worker_extension_cls=self._worker_extension_cls)
+            worker_extension_cls=self._worker_extension_cls,
+        )
         self.llm = AsyncLLM.from_engine_args(args)
         self.engine_startup_seconds = time.perf_counter() - started
         self.params = SamplingParams(max_tokens=1, temperature=0)
         started = time.perf_counter()
-        self.topology = (await self.llm.collective_rpc(
-            "nh_install", args=([asdict(s) for s in self.sites], self.sink.name,
-                                self.diagnostics, self.publication_threads)))[0]
+        self.topology = (
+            await self.llm.collective_rpc(
+                "nh_install",
+                args=([asdict(s) for s in self.sites], self.sink.name, self.diagnostics, self.publication_threads),
+            )
+        )[0]
         self.hook_install_seconds = time.perf_counter() - started
         self.installed = True
 
@@ -91,6 +120,7 @@ class VLLMExtractor(Extractor):
         async def request(row, rid):
             async for _ in self.llm.generate({"prompt_token_ids": row}, self.params, rid):
                 pass
+
         tasks = [asyncio.create_task(request(row, rid)) for row, rid in zip(tokens.tolist(), ids)]
         try:
             await asyncio.gather(*tasks)
@@ -119,6 +149,7 @@ class VLLMExtractor(Extractor):
             pending, completed = {}, {}
             next_yield = 0
             namespace = uuid.uuid4().hex
+
             async def collect():
                 nonlocal next_yield
                 for receipt in await self._poll():
@@ -135,7 +166,7 @@ class VLLMExtractor(Extractor):
                 while len(pending) > limit:
                     await collect()
                     if len(pending) > limit:
-                        await asyncio.sleep(.02)
+                        await asyncio.sleep(0.02)
                 return time.perf_counter() - started
 
             index = 0
@@ -152,8 +183,11 @@ class VLLMExtractor(Extractor):
                     wave_id = f"{namespace}-{index}"
                     ids = [f"{wave_id}-{row}" for row in range(len(chunk))]
                     rpc_started = time.perf_counter()
-                    admitted = (await self.llm.collective_rpc(
-                        "nh_begin", args=(wave_id, ids, chunk.tolist(), str(path.resolve()))))[0]
+                    admitted = (
+                        await self.llm.collective_rpc(
+                            "nh_begin", args=(wave_id, ids, chunk.tolist(), str(path.resolve()))
+                        )
+                    )[0]
                     self.worker_rpc_seconds += time.perf_counter() - rpc_started
                     if not admitted:
                         raise RuntimeError("Capture admission violated the two-slot bound")
@@ -172,15 +206,18 @@ class VLLMExtractor(Extractor):
         caller = asyncio.get_running_loop()
         messages = asyncio.Queue(maxsize=SLOTS)
         sending = []
+
         async def emit(receipt):
             # Runs on the engine loop; the put runs on the caller's loop and blocks there while two
             # receipts wait. Cancelling this await cancels that put through the wrapped future.
             put = asyncio.run_coroutine_threadsafe(messages.put(receipt), caller)
             sending[:] = [put]
             await asyncio.wrap_future(put)
+
         def abandon_put():
             for put in list(sending):
                 put.cancel()
+
         future = self._future(self._stream(token_batches, output_dir, emit))
         finished = asyncio.wrap_future(future)
         getter = None
@@ -210,10 +247,12 @@ class VLLMExtractor(Extractor):
                 getter.cancel()
             if not future.done():
                 future.cancel()
+
                 # The stream owns the worker until canceled tasks have unwound.
                 async def barrier():
                     async with self.lock:
                         pass
+
                 await asyncio.wrap_future(self._future(barrier()))
             abandon_put()
             if finished.done() and not finished.cancelled():
@@ -223,8 +262,10 @@ class VLLMExtractor(Extractor):
         tokens = validate_tokens(token_ids)
         with tempfile.TemporaryDirectory(dir=self.sink.name) as directory:
             receipts = []
+
             async def emit(receipt):
                 receipts.append(receipt)
+
             await self._stream([tokens], directory, emit)
             started = time.perf_counter()
             parts = {site.key: [] for site in self.sites}

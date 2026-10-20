@@ -2,6 +2,7 @@
 
 They expose routing discontinuities and replay an unquantized expert layer.
 """
+
 from __future__ import annotations
 
 import torch
@@ -10,21 +11,25 @@ import torch.nn.functional as F
 from .stats import same_expert_sets
 
 
-def manual_sigmoid_router(hidden_states, gate_weight, correction_bias, top_k,
-                          *, gate_bias=None, routed_scale=1.0):
+def manual_sigmoid_router(hidden_states, gate_weight, correction_bias, top_k, *, gate_bias=None, routed_scale=1.0):
     """PyTorch equation for the checkpoint's one-group sigmoid top-k router.
 
     The correction bias changes expert choice only. Weights are gathered from
     the uncorrected sigmoid scores, normalized, then scaled.
     """
-    x=hidden_states.float()
-    logits=F.linear(x,gate_weight.float(),None if gate_bias is None else gate_bias.float())
-    scores=torch.sigmoid(logits)
-    ids=(scores+correction_bias.float()).topk(int(top_k),dim=-1,sorted=False).indices
-    selected=scores.gather(-1,ids)
-    weights=selected/selected.sum(dim=-1,keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
-    return {'logits':logits,'scores':scores,'ids':ids,'weights':weights*float(routed_scale),
-            'normalized_weights':weights}
+    x = hidden_states.float()
+    logits = F.linear(x, gate_weight.float(), None if gate_bias is None else gate_bias.float())
+    scores = torch.sigmoid(logits)
+    ids = (scores + correction_bias.float()).topk(int(top_k), dim=-1, sorted=False).indices
+    selected = scores.gather(-1, ids)
+    weights = selected / selected.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
+    return {
+        "logits": logits,
+        "scores": scores,
+        "ids": ids,
+        "weights": weights * float(routed_scale),
+        "normalized_weights": weights,
+    }
 
 
 def routing_report(logits, correction_bias, selected_ids):
@@ -111,14 +116,16 @@ def manual_nemotron_moe(
     return {"output": output, "routed_cast": routed_cast}
 
 
-
-def decompose_four_outputs(reference_on_reference, reference_on_candidate,
-                           candidate_on_reference, candidate_on_candidate):
+def decompose_four_outputs(
+    reference_on_reference, reference_on_candidate, candidate_on_reference, candidate_on_candidate
+):
     """Return additive input/implementation effects from four observed outputs."""
     # Widen before subtracting: BF16 deltas would otherwise round separately
     # and obscure the algebraic decomposition being tested.
-    hh,hv,vh,vv=(value.float() for value in (reference_on_reference,
-        reference_on_candidate,candidate_on_reference,candidate_on_candidate))
+    hh, hv, vh, vv = (
+        value.float()
+        for value in (reference_on_reference, reference_on_candidate, candidate_on_reference, candidate_on_candidate)
+    )
     return {
         "input_effect": hv - hh,
         "implementation_effect_on_candidate_input": vv - hv,

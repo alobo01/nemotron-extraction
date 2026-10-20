@@ -7,32 +7,52 @@
 uv run benchmarks/sweep.py backend --backend hf --batch-size 8 --work outputs/tokens --output outputs/sweep
 Run the matching vllm phase next, then `report --output outputs/sweep`.
 """
+
 from __future__ import annotations
+
 import argparse
 import asyncio
-from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
 import json
 import multiprocessing
 import os
-from pathlib import Path
 import tempfile
 import time
 import uuid
-import torch
-from safetensors import safe_open
-from safetensors.torch import load_file, save_file
-from nemotron_extraction import HFExtractor, VLLMExtractor, HookSite
-from nemotron_extraction.hooks import representative_sites
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
 
-from benchlib.common import (DATA, batches, digest, is_memory_failure, job_minutes, load_tokens, package_hashes,
-                             versions, write_json)
+import torch
+from benchlib.common import (
+    DATA,
+    batches,
+    digest,
+    is_memory_failure,
+    job_minutes,
+    load_tokens,
+    package_hashes,
+    versions,
+    write_json,
+)
 from benchlib.instrumentation import chrome_trace, overlap_seconds
 from benchlib.stats import Agreement
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
+
+from nemotron_extraction import HFExtractor, HookSite, VLLMExtractor
+from nemotron_extraction.hooks import representative_sites
 
 SIZES = (8, 16, 32, 64, 128)
-TIMINGS = ("model_forward_seconds", "worker_forward_seconds", "cpu_copy_seconds", "worker_copy_seconds",
-           "worker_write_seconds", "generate_seconds", "backpressure_seconds", "final_drain_seconds")
+TIMINGS = (
+    "model_forward_seconds",
+    "worker_forward_seconds",
+    "cpu_copy_seconds",
+    "worker_copy_seconds",
+    "worker_write_seconds",
+    "generate_seconds",
+    "backpressure_seconds",
+    "final_drain_seconds",
+)
 
 
 def compare(paths, samples):
@@ -50,8 +70,10 @@ def compare(paths, samples):
         metric.add(reference[key], candidate[key])
         result[key] = (metric.result(), torch.cat(metric.cosines))
         if samples:
-            save_file({"hf": reference[key][:8].clone(), "vllm": candidate[key][:8].clone()},
-                      str(Path(samples) / f"sample-{key}.safetensors"))
+            save_file(
+                {"hf": reference[key][:8].clone(), "vllm": candidate[key][:8].clone()},
+                str(Path(samples) / f"sample-{key}.safetensors"),
+            )
     return result, time.perf_counter() - started
 
 
@@ -80,36 +102,70 @@ def restore_checkpoints(args, tokens, identity, checkpoint_dir, output_dir, metr
 def language_record(extractor, args, manifest, language, timeline, checkpoints, before, **totals):
     """Receipt for one completed language: throughput, stage timings, provenance and memory peaks."""
     timings = {key: getattr(extractor, key) - value for key, value in before.items()}
+
     # GPU event intervals remain exact when a phase continues after a job deadline.
     def event_seconds(name):
         return sum(item["end"] - item["start"] for item in timeline if item["name"] == name)
+
     forward_key = "model_forward_seconds" if args.backend == "hf" else "worker_forward_seconds"
     timings[forward_key] = event_seconds("forward")
     timings["cpu_copy_seconds" if args.backend == "hf" else "worker_copy_seconds"] = event_seconds("D2H")
     timings["worker_write_seconds"] = sum(item["shard"]["write_seconds"] for item in checkpoints)
     count, forward = totals["tokens"], timings[forward_key]
     attempts = {item.get("attempt") for item in timeline}
-    return {"status": "complete", "backend": args.backend, "language": language,
-            "batch_size": args.batch_size, "sequence_length": 2048, **totals,
-            "forward_tokens_per_second": count / forward if forward else None,
-            "disk_tokens_per_second": count / totals["publication_seconds"], **timings,
-            "timing_scope": "all committed shards; admission/generation/drain counters cover current attempt",
-            "actual_forward_batches": dict(Counter(
-                size for checkpoint in checkpoints for size in checkpoint["shard"].get("actual_forward_batches",
-                    [min(args.batch_size, max(1, checkpoint["tokens"] // 2048))]))),
-            # Events from different attempts use different clock origins, so overlap is per attempt.
-            "overlap_seconds": {name: sum(overlap_seconds([item for item in timeline if item.get("attempt") == attempt], name)
-                                          for attempt in attempts)
-                                for name in ("D2H", "write")},
-            "topology": extractor.topology, "software": versions(),
-            "gpu": torch.cuda.get_device_name(), "manifest_sha256": digest(args.work / "manifest.json"),
-            "package_hashes": package_hashes(), "script_sha256": digest(__file__),
-            "source": {"model_revision": manifest["model_revision"], "tokenizer_revision": manifest["tokenizer_revision"],
-                       "dataset": manifest["languages"][language]}, "cuda_graphs_enabled": False,
-            "memory_limit_fraction": .96, "kv_cache_memory_bytes": getattr(extractor, "kv_cache_memory_bytes", None),
-            **{key: getattr(extractor, key) for key in ("peak_gpu_memory_bytes", "peak_gpu_reserved_bytes",
-                                                        "peak_device_memory_bytes", "total_device_memory_bytes",
-                                                        "peak_device_memory_fraction")}}
+    return {
+        "status": "complete",
+        "backend": args.backend,
+        "language": language,
+        "batch_size": args.batch_size,
+        "sequence_length": 2048,
+        **totals,
+        "forward_tokens_per_second": count / forward if forward else None,
+        "disk_tokens_per_second": count / totals["publication_seconds"],
+        **timings,
+        "timing_scope": "all committed shards; admission/generation/drain counters cover current attempt",
+        "actual_forward_batches": dict(
+            Counter(
+                size
+                for checkpoint in checkpoints
+                for size in checkpoint["shard"].get(
+                    "actual_forward_batches", [min(args.batch_size, max(1, checkpoint["tokens"] // 2048))]
+                )
+            )
+        ),
+        # Events from different attempts use different clock origins, so overlap is per attempt.
+        "overlap_seconds": {
+            name: sum(
+                overlap_seconds([item for item in timeline if item.get("attempt") == attempt], name)
+                for attempt in attempts
+            )
+            for name in ("D2H", "write")
+        },
+        "topology": extractor.topology,
+        "software": versions(),
+        "gpu": torch.cuda.get_device_name(),
+        "manifest_sha256": digest(args.work / "manifest.json"),
+        "package_hashes": package_hashes(),
+        "script_sha256": digest(__file__),
+        "source": {
+            "model_revision": manifest["model_revision"],
+            "tokenizer_revision": manifest["tokenizer_revision"],
+            "dataset": manifest["languages"][language],
+        },
+        "cuda_graphs_enabled": False,
+        "memory_limit_fraction": 0.96,
+        "kv_cache_memory_bytes": getattr(extractor, "kv_cache_memory_bytes", None),
+        **{
+            key: getattr(extractor, key)
+            for key in (
+                "peak_gpu_memory_bytes",
+                "peak_gpu_reserved_bytes",
+                "peak_device_memory_bytes",
+                "total_device_memory_bytes",
+                "peak_device_memory_fraction",
+            )
+        },
+    }
 
 
 async def language(extractor, args, manifest, language, comparison_pool):
@@ -118,20 +174,28 @@ async def language(extractor, args, manifest, language, comparison_pool):
     receipt_path = run / f"{args.backend}.json"
     if receipt_path.exists():
         record = json.loads(receipt_path.read_text())
-        if (record.get("status") == "complete" and record["tokens"] == args.tokens
-                and record["package_hashes"] == package_hashes()
-                and record["manifest_sha256"] == digest(args.work / "manifest.json")
-                and record["script_sha256"] == digest(__file__)):
+        if (
+            record.get("status") == "complete"
+            and record["tokens"] == args.tokens
+            and record["package_hashes"] == package_hashes()
+            and record["manifest_sha256"] == digest(args.work / "manifest.json")
+            and record["script_sha256"] == digest(__file__)
+        ):
             print(f"resume: {args.backend}/{language}/b{args.batch_size} already complete", flush=True)
             return record
         raise ValueError("Existing incompatible receipt; use a fresh output directory")
-    tokens = load_tokens(args.work, language, manifest)[:args.tokens]
+    tokens = load_tokens(args.work, language, manifest)[: args.tokens]
     output_dir = run / ("reference" if args.backend == "hf" else "candidate")
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir = run / "checkpoints"
     checkpoint_dir.mkdir(exist_ok=True)
-    identity = {"package_hashes": package_hashes(), "manifest_sha256": digest(args.work / "manifest.json"),
-                "script_sha256": digest(__file__), "batch_size": args.batch_size, "tokens": args.tokens}
+    identity = {
+        "package_hashes": package_hashes(),
+        "manifest_sha256": digest(args.work / "manifest.json"),
+        "script_sha256": digest(__file__),
+        "batch_size": args.batch_size,
+        "tokens": args.tokens,
+    }
     identity_path = run / f"{args.backend}-identity.json"
     if identity_path.exists() and json.loads(identity_path.read_text()) != identity:
         raise ValueError("Resume identity differs; use a fresh output directory")
@@ -141,14 +205,14 @@ async def language(extractor, args, manifest, language, comparison_pool):
     epoch = uuid.uuid4().hex
     metrics = {site.key: Agreement() for site in extractor.sites}
     hf_run = run.parent / "hf-run.json"
-    can_compare = (args.backend == "vllm" and hf_run.exists()
-                   and json.loads(hf_run.read_text())["status"] == "complete")
-    checkpoints = restore_checkpoints(args, tokens, identity, checkpoint_dir, output_dir,
-                                      metrics if can_compare else None)
+    can_compare = args.backend == "vllm" and hf_run.exists() and json.loads(hf_run.read_text())["status"] == "complete"
+    checkpoints = restore_checkpoints(
+        args, tokens, identity, checkpoint_dir, output_dir, metrics if can_compare else None
+    )
     prefix = len(checkpoints)
     count = sum(value["tokens"] for value in checkpoints)
-    comparisons = sum(value["comparison_seconds"] for value in checkpoints) if can_compare else 0.
-    base_elapsed = checkpoints[-1]["pipeline_elapsed"] if checkpoints else 0.
+    comparisons = sum(value["comparison_seconds"] for value in checkpoints) if can_compare else 0.0
+    base_elapsed = checkpoints[-1]["pipeline_elapsed"] if checkpoints else 0.0
     timeline = [item for value in checkpoints for item in value["shard"].get("timeline", [])]
     # Incomplete publications carry no committed checkpoint and can be retried.
     for path in output_dir.glob("*.safetensors*"):
@@ -168,9 +232,14 @@ async def language(extractor, args, manifest, language, comparison_pool):
             metrics[key].merge_result(value, cosines)
         checkpoint = checkpoint_dir / f"vllm-{global_index:06d}.json"
         save_file({key: cosine for key, (_, cosine) in values.items()}, str(checkpoint.with_suffix(".safetensors")))
-        committed = {"identity": identity, "tokens": shard["tokens"], "shard": shard,
-                     "comparison_seconds": seconds, "agreement": {key: value for key, (value, _) in values.items()},
-                     "pipeline_elapsed": base_elapsed + time.perf_counter() - started}
+        committed = {
+            "identity": identity,
+            "tokens": shard["tokens"],
+            "shard": shard,
+            "comparison_seconds": seconds,
+            "agreement": {key: value for key, (value, _) in values.items()},
+            "pipeline_elapsed": base_elapsed + time.perf_counter() - started,
+        }
         write_json(checkpoint, committed)
         checkpoints.append(committed)
         Path(paths[1]).unlink()
@@ -196,8 +265,12 @@ async def language(extractor, args, manifest, language, comparison_pool):
                 if Path(shard["path"]) != canonical:
                     Path(shard["path"]).replace(canonical)
                     shard["path"] = str(canonical)
-                committed = {"identity": identity, "tokens": shard["tokens"], "shard": shard,
-                             "pipeline_elapsed": base_elapsed + last_publication - started}
+                committed = {
+                    "identity": identity,
+                    "tokens": shard["tokens"],
+                    "shard": shard,
+                    "pipeline_elapsed": base_elapsed + last_publication - started,
+                }
                 write_json(checkpoint_dir / f"hf-{global_index:06d}.json", committed)
                 checkpoints.append(committed)
             if can_compare:
@@ -210,8 +283,12 @@ async def language(extractor, args, manifest, language, comparison_pool):
                 if len(pending) >= 2:
                     await finish(pending.pop(0))
             elif args.backend == "vllm":
-                committed = {"identity": identity, "tokens": shard["tokens"], "shard": shard,
-                             "pipeline_elapsed": base_elapsed + last_publication - started}
+                committed = {
+                    "identity": identity,
+                    "tokens": shard["tokens"],
+                    "shard": shard,
+                    "pipeline_elapsed": base_elapsed + last_publication - started,
+                }
                 write_json(checkpoint_dir / f"vllm-{global_index:06d}.json", committed)
                 checkpoints.append(committed)
             if shard["index"] % 10 == 0:
@@ -224,9 +301,20 @@ async def language(extractor, args, manifest, language, comparison_pool):
     elapsed = base_elapsed + time.perf_counter() - started
     if count != args.tokens:
         raise ValueError(f"Expected {args.tokens} prompt tokens, got {count}")
-    record = language_record(extractor, args, manifest, language, timeline, checkpoints, before,
-                             tokens=count, publication_seconds=publication_seconds, phase_seconds=elapsed,
-                             comparison_seconds=comparisons, resumed_shards=prefix)
+    record = language_record(
+        extractor,
+        args,
+        manifest,
+        language,
+        timeline,
+        checkpoints,
+        before,
+        tokens=count,
+        publication_seconds=publication_seconds,
+        phase_seconds=elapsed,
+        comparison_seconds=comparisons,
+        resumed_shards=prefix,
+    )
     if can_compare:
         record["agreement"] = {key: metric.result() for key, metric in metrics.items()}
         record["passed"] = all(metric["passed"] for metric in record["agreement"].values())
@@ -260,24 +348,36 @@ def backend(args):
     try:
         if args.backend == "hf":
             from transformers import AutoModelForCausalLM
-            model = AutoModelForCausalLM.from_pretrained(manifest["model_path"], torch_dtype=torch.bfloat16,
-                                                        device_map="cuda", trust_remote_code=True, local_files_only=True)
+
+            model = AutoModelForCausalLM.from_pretrained(
+                manifest["model_path"],
+                torch_dtype=torch.bfloat16,
+                device_map="cuda",
+                trust_remote_code=True,
+                local_files_only=True,
+            )
             model_load = time.perf_counter() - started
             sites = representative_sites(model)
             extractor = HFExtractor(model, sites)
             write_json(sites_file, [{"layer": site.layer, "kind": site.kind} for site in sites])
         else:
             sites = [HookSite(**site) for site in json.loads(sites_file.read_text())]
-            extractor = VLLMExtractor(manifest["model_path"], sites, sequences_per_call=args.batch_size,
-                                      sink_dir=os.environ.get("NH_SINK_DIR"), max_model_len=2049,
-                                      gpu_memory_utilization=.96,
-                                      kv_cache_memory_bytes=int(os.environ.get("NH_KV_CACHE_BYTES", 1536 * 2**20)))
+            extractor = VLLMExtractor(
+                manifest["model_path"],
+                sites,
+                sequences_per_call=args.batch_size,
+                sink_dir=os.environ.get("NH_SINK_DIR"),
+                max_model_len=2049,
+                gpu_memory_utilization=0.96,
+                kv_cache_memory_bytes=int(os.environ.get("NH_KV_CACHE_BYTES", 1536 * 2**20)),
+            )
             model_load = extractor.engine_startup_seconds
         startup = time.perf_counter() - started
         phase = "warmup"
         tokens = load_file(str(args.work / "en.safetensors"))["token_ids"]
-        warm_tokens = tokens[:args.batch_size * 2048].reshape(args.batch_size, 2048)
+        warm_tokens = tokens[: args.batch_size * 2048].reshape(args.batch_size, 2048)
         warm_started = time.perf_counter()
+
         # Two complete batches exercise both reusable capture slots.
         async def warmup():
             with tempfile.TemporaryDirectory(dir=os.environ.get("NH_SINK_DIR")) as directory:
@@ -286,20 +386,32 @@ def backend(args):
                     traces.extend(receipt.get("timeline", []))
                 if args.profile:
                     write_json(root / f"{args.backend}-warmup-trace.json", chrome_trace(traces, args.backend))
+
         asyncio.run(warmup())
         warmup_seconds = time.perf_counter() - warm_started
         phase = "extraction"
         with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as pool:
             for lang in DATA:
                 records.append(asyncio.run(language(extractor, args, manifest, lang, pool)))
-        summary = {"status": "complete", "startup_seconds": startup, "model_load_seconds": model_load,
-                   "hook_install_seconds": extractor.hook_install_seconds, "warmup_seconds": warmup_seconds,
-                   "phase_seconds": time.perf_counter() - started, "languages": records}
+        summary = {
+            "status": "complete",
+            "startup_seconds": startup,
+            "model_load_seconds": model_load,
+            "hook_install_seconds": extractor.hook_install_seconds,
+            "warmup_seconds": warmup_seconds,
+            "phase_seconds": time.perf_counter() - started,
+            "languages": records,
+        }
     except Exception as error:
         memory_failure = is_memory_failure(error)
-        summary = {"status": "memory_failure" if memory_failure else "error", "failed_phase": phase,
-                   "error_type": type(error).__name__, "error": str(error),
-                   "phase_seconds": time.perf_counter() - started, "languages": records}
+        summary = {
+            "status": "memory_failure" if memory_failure else "error",
+            "failed_phase": phase,
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "phase_seconds": time.perf_counter() - started,
+            "languages": records,
+        }
         write_json(root / f"{args.backend}-run.json", summary)
         if not memory_failure:
             raise
@@ -311,8 +423,13 @@ def backend(args):
                 if summary is None or summary["status"] == "complete":
                     raise
                 summary["cleanup_error"] = str(cleanup_error)
-    summary.update(backend=args.backend, batch_size=args.batch_size, requested_tokens=args.tokens,
-                   package_hashes=package_hashes(), software=versions())
+    summary.update(
+        backend=args.backend,
+        batch_size=args.batch_size,
+        requested_tokens=args.tokens,
+        package_hashes=package_hashes(),
+        software=versions(),
+    )
     write_json(root / f"{args.backend}-run.json", summary)
     print(json.dumps({key: summary[key] for key in ("status", "backend", "batch_size", "phase_seconds")}), flush=True)
 
@@ -325,8 +442,13 @@ def report(args):
             for engine in ("hf", "vllm"):
                 path = args.output / f"b{batch}" / lang / f"{engine}.json"
                 run_path = args.output / f"b{batch}" / f"{engine}-run.json"
-                pair.append(json.loads(path.read_text()) if path.exists() else
-                            json.loads(run_path.read_text()) if run_path.exists() else {"status": "pending"})
+                pair.append(
+                    json.loads(path.read_text())
+                    if path.exists()
+                    else json.loads(run_path.read_text())
+                    if run_path.exists()
+                    else {"status": "pending"}
+                )
             hf, vllm = pair
             if hf["status"] == vllm["status"] == "complete" and "tokens" in hf and "tokens" in vllm:
                 for key in ("tokens", "batch_size", "manifest_sha256", "package_hashes", "script_sha256", "source"):
@@ -337,23 +459,45 @@ def report(args):
             else:
                 rows.append({"batch": batch, "language": lang, "hf": hf, "vllm": vllm})
     write_json(args.output / "results.json", rows)
-    lines = ["# Asynchronous activation batch sweep", "", "| Batch | Language | HF disk tok/s | vLLM disk tok/s | Ratio | Gate/status |",
-             "|---:|---|---:|---:|---:|---|"]
+    lines = [
+        "# Asynchronous activation batch sweep",
+        "",
+        "| Batch | Language | HF disk tok/s | vLLM disk tok/s | Ratio | Gate/status |",
+        "|---:|---|---:|---:|---:|---|",
+    ]
     for row in rows:
         if "disk_speedup" in row:
-            lines.append(f"| {row['batch']} | {row['language']} | {row['hf']['disk_tokens_per_second']:.1f} | {row['vllm']['disk_tokens_per_second']:.1f} | {row['disk_speedup']:.2f} | {'PASS' if row['vllm']['passed'] else 'FAIL'} |")
+            lines.append(
+                f"| {row['batch']} | {row['language']} | {row['hf']['disk_tokens_per_second']:.1f} "
+                f"| {row['vllm']['disk_tokens_per_second']:.1f} | {row['disk_speedup']:.2f} "
+                f"| {'PASS' if row['vllm']['passed'] else 'FAIL'} |"
+            )
         else:
-            rates = [f"{row[engine]['disk_tokens_per_second']:.1f}" if "disk_tokens_per_second" in row[engine] else "—"
-                     for engine in ("hf", "vllm")]
-            lines.append(f"| {row['batch']} | {row['language']} | {rates[0]} | {rates[1]} | — | HF: {row['hf']['status']}; vLLM: {row['vllm']['status']} |")
-    lines += ["", "Disk throughput includes capture, transfer, publication and pipeline backpressure. Numerical comparison runs in a separate CPU process and can limit admission when its bounded queue fills. Forward throughput, actual forward sizes, startup, warmup, copy/write timings and memory peaks are in JSON. CUDA graphs are disabled. A numerical failure remains a failure regardless of throughput."]
+            rates = [
+                f"{row[engine]['disk_tokens_per_second']:.1f}" if "disk_tokens_per_second" in row[engine] else "—"
+                for engine in ("hf", "vllm")
+            ]
+            lines.append(
+                f"| {row['batch']} | {row['language']} | {rates[0]} | {rates[1]} "
+                f"| — | HF: {row['hf']['status']}; vLLM: {row['vllm']['status']} "
+                "|"
+            )
+    lines += [
+        "",
+        "Disk throughput includes capture, transfer, publication and pipeline "
+        "backpressure. Numerical comparison runs in a separate CPU process "
+        "and can limit admission when its bounded queue fills. Forward throughput, "
+        "actual forward sizes, startup, warmup, copy/write timings and memory "
+        "peaks are in JSON. CUDA graphs are disabled. A numerical failure remains "
+        "a failure regardless of throughput.",
+    ]
     (args.output / "report.md").write_text("\n".join(lines) + "\n")
 
 
 def schedule(args):
     jobs = []
     for batch in SIZES:
-        total = 0.
+        total = 0.0
         for engine in ("hf", "vllm"):
             path = args.output / f"b{batch}" / f"{engine}-run.json"
             if not path.exists():

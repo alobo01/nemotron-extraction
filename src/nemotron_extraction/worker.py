@@ -1,8 +1,12 @@
 """Nemotron hooks inside a vLLM worker; RPCs never wait for shard writes."""
+
 from __future__ import annotations
-from concurrent.futures import ThreadPoolExecutor
+
 import time
+from concurrent.futures import ThreadPoolExecutor
+
 import torch
+
 from .hooks import install
 from .transport import BufferPool, capture_seconds, finish_copy, memory_peaks, publish, seconds, timeline
 from .types import HookSite, validate_publication_threads
@@ -39,12 +43,19 @@ class ActivationHookExtension:
         self.nh_keys = [site.key for site in specs]
         model = self.model_runner.model
         try:
-            self.nh_handles, self.nh_topology = install(model, specs, self.nh_captured, worker=True,
-                capture_events=self.nh_capture_events if diagnostics else None)
-            self.nh_handles.extend([
-                model.register_forward_pre_hook(self._nh_inputs, with_kwargs=True),
-                model.register_forward_hook(self._nh_end),
-            ])
+            self.nh_handles, self.nh_topology = install(
+                model,
+                specs,
+                self.nh_captured,
+                worker=True,
+                capture_events=self.nh_capture_events if diagnostics else None,
+            )
+            self.nh_handles.extend(
+                [
+                    model.register_forward_pre_hook(self._nh_inputs, with_kwargs=True),
+                    model.register_forward_hook(self._nh_end),
+                ]
+            )
         except BaseException:
             self.nh_copy.shutdown()
             self.nh_writer.shutdown()
@@ -62,13 +73,25 @@ class ActivationHookExtension:
         if len(request_ids) != len(tokens) or len(set(request_ids)) != len(request_ids):
             self.nh_pool.release(slot)
             raise ValueError("Each prompt requires a unique request ID")
-        self.nh_active = {"id": wave_id, "slot": slot, "tokens": tokens,
-                          "requests": {rid: i for i, rid in enumerate(request_ids)},
-                          "path": path, "tensors": {"token_ids": tokens}, "copies": [],
-                          "covered": set(), "forward_events": [], "forward_batches": [],
-                          "copy_events": [], "origin": self.nh_origin,
-                          "scheduler": [], "diagnostics": self.nh_diagnostics,
-                          "capture_events": [], "origin_cpu": self.nh_origin_cpu, "memory": {}}
+        self.nh_active = {
+            "id": wave_id,
+            "slot": slot,
+            "tokens": tokens,
+            "requests": {rid: i for i, rid in enumerate(request_ids)},
+            "path": path,
+            "tensors": {"token_ids": tokens},
+            "copies": [],
+            "covered": set(),
+            "forward_events": [],
+            "forward_batches": [],
+            "copy_events": [],
+            "origin": self.nh_origin,
+            "scheduler": [],
+            "diagnostics": self.nh_diagnostics,
+            "capture_events": [],
+            "origin_cpu": self.nh_origin_cpu,
+            "memory": {},
+        }
         return True
 
     def _nh_inputs(self, module, args, kwargs):
@@ -79,7 +102,7 @@ class ActivationHookExtension:
         batch = runner.input_batch
         ids = list(batch.req_ids)
         # CPU scheduler metadata: no CUDA synchronization or token-content matching.
-        starts = runner.query_start_loc.cpu[:len(ids) + 1].tolist()
+        starts = runner.query_start_loc.cpu[: len(ids) + 1].tolist()
         spans = []
         length = wave["tokens"].shape[1]
         for index, rid in enumerate(ids):
@@ -94,11 +117,20 @@ class ActivationHookExtension:
             if prompt_index in wave["covered"]:
                 raise RuntimeError("Prompt captured twice")
             if self.nh_diagnostics and not torch.equal(
-                    batch.token_ids_cpu[index, :length], wave["tokens"][prompt_index]):
+                batch.token_ids_cpu[index, :length], wave["tokens"][prompt_index]
+            ):
                 raise RuntimeError("Worker input token IDs differ from submitted prompt")
             spans.append((prompt_index, start, end))
-            wave["scheduler"].append(dict(request_id=rid, sequence_index=prompt_index,
-                start=start, stop=end, computed_tokens=computed, prompt_length=length))
+            wave["scheduler"].append(
+                dict(
+                    request_id=rid,
+                    sequence_index=prompt_index,
+                    start=start,
+                    stop=end,
+                    computed_tokens=computed,
+                    prompt_length=length,
+                )
+            )
             wave["covered"].add(prompt_index)
         self.nh_spans = spans
         self.nh_forward_start = torch.cuda.Event(enable_timing=True)
@@ -126,12 +158,11 @@ class ActivationHookExtension:
             for key, source in captured.items():
                 if source.ndim != 2 or any(stop > source.shape[0] for _, _, stop in self.nh_spans):
                     raise RuntimeError(f"{key}: capture shape does not cover scheduler spans")
-                host = self.nh_pool.tensor(wave["slot"], key, (total_rows, source.shape[-1]),
-                                           source.dtype, pinned=True)
+                host = self.nh_pool.tensor(wave["slot"], key, (total_rows, source.shape[-1]), source.dtype, pinned=True)
                 wave["tensors"][key] = host
                 self.nh_topology[key]["width"] = source.shape[-1]
                 for index, start, stop in self.nh_spans:
-                    host[index * length:(index + 1) * length].copy_(source[start:stop], non_blocking=True)
+                    host[index * length : (index + 1) * length].copy_(source[start:stop], non_blocking=True)
                 source.record_stream(self.nh_stream)
             ended.record()
         wave["copies"].append(self.nh_copy.submit(finish_copy, started, ended, captured))
@@ -157,15 +188,24 @@ class ActivationHookExtension:
         forward_seconds = sum(seconds(start, end) for start, end in wave["forward_events"])
         write_start = time.perf_counter() - wave["origin_cpu"]
         receipt = publish(wave["tensors"], wave["path"], {"wave_id": wave["id"]})
-        receipt.update(wave["memory"], wave_id=wave["id"], tokens=wave["tokens"].numel(),
-                       capture_seconds=capture_seconds(wave["capture_events"]) if wave["diagnostics"] else None,
-                       worker_copy_seconds=copy_seconds, worker_forward_seconds=forward_seconds,
-                       actual_forward_batches=wave["forward_batches"], topology=wave["topology"],
-                       scheduler=wave["scheduler"], diagnostics=wave["diagnostics"])
-        receipt["timeline"] = timeline(wave["origin"], (("forward", wave["forward_events"]),
-                                                        ("D2H", wave["copy_events"])))
-        receipt["timeline"].append({"name": "write", "start": write_start,
-                                    "end": time.perf_counter() - wave["origin_cpu"]})
+        receipt.update(
+            wave["memory"],
+            wave_id=wave["id"],
+            tokens=wave["tokens"].numel(),
+            capture_seconds=capture_seconds(wave["capture_events"]) if wave["diagnostics"] else None,
+            worker_copy_seconds=copy_seconds,
+            worker_forward_seconds=forward_seconds,
+            actual_forward_batches=wave["forward_batches"],
+            topology=wave["topology"],
+            scheduler=wave["scheduler"],
+            diagnostics=wave["diagnostics"],
+        )
+        receipt["timeline"] = timeline(
+            wave["origin"], (("forward", wave["forward_events"]), ("D2H", wave["copy_events"]))
+        )
+        receipt["timeline"].append(
+            {"name": "write", "start": write_start, "end": time.perf_counter() - wave["origin_cpu"]}
+        )
         return receipt
 
     def nh_poll(self):

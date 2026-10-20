@@ -1,14 +1,17 @@
 from __future__ import annotations
-import gc
+
 import asyncio
+import gc
+import sys
 import threading
 import time
-import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import NamedTuple
+
 import torch
 from torch import nn
+
 from .extractor import Extractor
 from .hooks import install, repair_time_step_limits
 from .transport import SLOTS, BufferPool, capture_seconds, finish_copy, memory_peaks, publish, timeline
@@ -30,17 +33,34 @@ class Capture(NamedTuple):
 
 class HFExtractor(Extractor):
     """Eager PyTorch reference; accepts a model ID or a caller-owned nn.Module."""
-    def __init__(self, model, sites, *, revision=None, device="cuda", dtype=torch.bfloat16,
-                 trust_remote_code=True, local_files_only=False, diagnostics=False,
-                 publication_threads=1):
+
+    def __init__(
+        self,
+        model,
+        sites,
+        *,
+        revision=None,
+        device="cuda",
+        dtype=torch.bfloat16,
+        trust_remote_code=True,
+        local_files_only=False,
+        diagnostics=False,
+        publication_threads=1,
+    ):
         super().__init__(sites, diagnostics, publication_threads)
         self.owns_model = not isinstance(model, nn.Module)
         started = time.perf_counter()
         if self.owns_model:
             from transformers import AutoModelForCausalLM
+
             model = AutoModelForCausalLM.from_pretrained(
-                model, revision=revision, torch_dtype=dtype, device_map=device,
-                trust_remote_code=trust_remote_code, local_files_only=local_files_only)
+                model,
+                revision=revision,
+                torch_dtype=dtype,
+                device_map=device,
+                trust_remote_code=trust_remote_code,
+                local_files_only=local_files_only,
+            )
         repair_time_step_limits(model)
         self.model_load_seconds = time.perf_counter() - started
         self.model = model
@@ -65,8 +85,9 @@ class HFExtractor(Extractor):
         self.origin_cpu = time.perf_counter()
         started = time.perf_counter()
         try:
-            self.handles, self.topology = install(model, self.sites, self.captured,
-                capture_events=self.capture_events if diagnostics else None)
+            self.handles, self.topology = install(
+                model, self.sites, self.captured, capture_events=self.capture_events if diagnostics else None
+            )
             self.hook_install_seconds = time.perf_counter() - started
         except Exception:
             self.close()
@@ -102,9 +123,13 @@ class HFExtractor(Extractor):
             with self._evaluating() as decoder:
                 with torch.inference_mode():
                     decoder(input_ids=tokens.to(self.device), use_cache=False)
-                return DeviceActivationBatch(tokens, {
-                    site.key: self.captured[site.key].reshape(-1, self.captured[site.key].shape[-1]).clone()
-                    for site in self.sites})
+                return DeviceActivationBatch(
+                    tokens,
+                    {
+                        site.key: self.captured[site.key].reshape(-1, self.captured[site.key].shape[-1]).clone()
+                        for site in self.sites
+                    },
+                )
         finally:
             self.stream_lock.release()
 
@@ -143,8 +168,9 @@ class HFExtractor(Extractor):
             sources = dict(self.captured)
             for site in self.sites:
                 value = sources[site.key]
-                values[site.key] = self.pool.tensor(slot, site.key, (tokens.numel(), value.shape[-1]),
-                                                   value.dtype, pinned=self.copy_stream is not None)
+                values[site.key] = self.pool.tensor(
+                    slot, site.key, (tokens.numel(), value.shape[-1]), value.dtype, pinned=self.copy_stream is not None
+                )
                 self.topology[site.key]["width"] = value.shape[-1]
             if self.copy_stream is not None:
                 copy_start, copy_end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
@@ -185,11 +211,14 @@ class HFExtractor(Extractor):
                 self.serialization_seconds += receipt["serialization_seconds"]
             receipt.update(index=index, tokens=tokens.numel())
             receipt["capture_seconds"] = capture_seconds(capture.capture_events) if self.diagnostics else None
-            receipt["timeline"] = (timeline(self.origin, (("forward", [capture.forward_events]),
-                                                          ("D2H", [capture.copy_events])))
-                                   if capture.forward_events else [])
-            receipt["timeline"].append({"name": "write", "start": write_start,
-                                        "end": time.perf_counter() - self.origin_cpu})
+            receipt["timeline"] = (
+                timeline(self.origin, (("forward", [capture.forward_events]), ("D2H", [capture.copy_events])))
+                if capture.forward_events
+                else []
+            )
+            receipt["timeline"].append(
+                {"name": "write", "start": write_start, "end": time.perf_counter() - self.origin_cpu}
+            )
             return receipt
         finally:
             self.pool.release(slot)
@@ -223,8 +252,11 @@ class HFExtractor(Extractor):
                         capture = await job
                         await asyncio.to_thread(self._finish, capture)
                         raise
-                    pending.append(self.writer.submit(self._publish, tokens, slot, capture,
-                                                       self.shard_path(output_dir, index), index))
+                    pending.append(
+                        self.writer.submit(
+                            self._publish, tokens, slot, capture, self.shard_path(output_dir, index), index
+                        )
+                    )
                 except BaseException:
                     self.pool.release(slot)
                     raise
@@ -238,8 +270,9 @@ class HFExtractor(Extractor):
             unwinding = sys.exc_info()[0] is not None
             try:
                 # Drain every writer even when the first one failed.
-                results = await asyncio.shield(asyncio.gather(
-                    *(asyncio.wrap_future(future) for future in pending), return_exceptions=True))
+                results = await asyncio.shield(
+                    asyncio.gather(*(asyncio.wrap_future(future) for future in pending), return_exceptions=True)
+                )
                 if not unwinding:
                     for result in results:
                         if isinstance(result, BaseException):

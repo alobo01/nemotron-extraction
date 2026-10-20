@@ -1,16 +1,19 @@
 """Check that the installed vLLM still exposes the engine and runner internals the worker relies on."""
+
 import importlib.metadata
 import inspect
 from pathlib import Path
+
+from vllm import AsyncEngineArgs
+from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
 import nemotron_extraction
 from nemotron_extraction.worker import ActivationHookExtension
 
 print("package:", Path(nemotron_extraction.__file__).resolve())
 print("worker:", ActivationHookExtension.__module__)
-from vllm import AsyncEngineArgs
-from vllm.v1.engine.async_llm import AsyncLLM
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.engine.input_processor import InputProcessor
 
 print("vllm:", importlib.metadata.version("vllm"))
 for name in ("collective_rpc", "generate", "shutdown", "abort"):

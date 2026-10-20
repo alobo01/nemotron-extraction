@@ -1,4 +1,5 @@
 """Three-layer stand-in for the Nemotron decoder: Mamba, MoE and attention mixers."""
+
 import torch
 from torch import nn
 
@@ -18,7 +19,7 @@ class TinyAttention(nn.Module):
         super().__init__()
         self.o_proj = nn.Linear(4, 2, bias=False)
         with torch.no_grad():
-            self.o_proj.weight.copy_(torch.tensor([[1., 0., 0., 0.], [0., 1., 0., 0.]]))
+            self.o_proj.weight.copy_(torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]))
 
     def forward(self, hidden_states):
         return self.o_proj(torch.cat([hidden_states, hidden_states + 5], -1))

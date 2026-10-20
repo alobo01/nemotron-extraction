@@ -1,4 +1,5 @@
 """Check the installed wheel from outside the checkout: python tests/smoke/wheel.py, run from another directory."""
+
 import importlib.metadata
 import inspect
 from pathlib import Path

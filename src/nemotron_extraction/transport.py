@@ -1,4 +1,5 @@
 """Bounded pinned buffers and event-ordered GPU-to-host transfers."""
+
 from __future__ import annotations
 
 import threading
@@ -9,14 +10,20 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 
-MEMORY_KEYS = ("peak_gpu_memory_bytes", "peak_gpu_reserved_bytes", "peak_device_memory_bytes",
-               "total_device_memory_bytes", "peak_device_memory_fraction")
+MEMORY_KEYS = (
+    "peak_gpu_memory_bytes",
+    "peak_gpu_reserved_bytes",
+    "peak_device_memory_bytes",
+    "total_device_memory_bytes",
+    "peak_device_memory_fraction",
+)
 # One capture being filled while the previous one is written.
 SLOTS = 2
 
 
 class BufferPool:
     """Release a slot only after its consumer finishes."""
+
     def __init__(self):
         self.slots = [{} for _ in range(SLOTS)]
         self.free = list(range(SLOTS))
@@ -68,17 +75,29 @@ def capture_seconds(events):
 
 def timeline(origin, spans):
     """Place named (start, end) CUDA event pairs relative to a shared origin event."""
-    return [{"name": name, "start": seconds(origin, started), "end": seconds(origin, ended)}
-            for name, pairs in spans for started, ended in pairs]
+    return [
+        {"name": name, "start": seconds(origin, started), "end": seconds(origin, ended)}
+        for name, pairs in spans
+        for started, ended in pairs
+    ]
 
 
 def memory_peaks(previous=None, device=None):
     """Fold current CUDA memory statistics into running maxima keyed by MEMORY_KEYS."""
     args = () if device is None else (device,)
     free, total = torch.cuda.mem_get_info(*args)
-    current = dict(zip(MEMORY_KEYS, (
-        torch.cuda.max_memory_allocated(*args), torch.cuda.max_memory_reserved(*args),
-        total - free, total, (total - free) / total if total else 0.0)))
+    current = dict(
+        zip(
+            MEMORY_KEYS,
+            (
+                torch.cuda.max_memory_allocated(*args),
+                torch.cuda.max_memory_reserved(*args),
+                total - free,
+                total,
+                (total - free) / total if total else 0.0,
+            ),
+        )
+    )
     previous = previous or {}
     return {key: max(value, previous.get(key, 0)) for key, value in current.items()}
 
@@ -110,8 +129,11 @@ def publish(tensors, path, metadata=None):
         save_file(tensors, str(partial), metadata=metadata)
         serialized = time.perf_counter()
     finished = time.perf_counter()
-    return {"path": str(path), "bytes": path.stat().st_size,
-            "validation_seconds": validated - started,
-            "serialization_seconds": serialized - validated,
-            "publication_seconds": finished - serialized,
-            "write_seconds": finished - started}
+    return {
+        "path": str(path),
+        "bytes": path.stat().st_size,
+        "validation_seconds": validated - started,
+        "serialization_seconds": serialized - validated,
+        "publication_seconds": finished - serialized,
+        "write_seconds": finished - started,
+    }
