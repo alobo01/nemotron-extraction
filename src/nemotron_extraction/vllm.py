@@ -1,6 +1,5 @@
 from __future__ import annotations
 import asyncio
-import queue
 import tempfile
 import threading
 import time
@@ -185,23 +184,45 @@ class VLLMExtractor:
 
     async def stream_to_disk(self, token_batches, output_dir):
         """Yield ordered durable shard receipts; two publications may overlap inference."""
-        messages = queue.Queue(maxsize=2)
+        caller = asyncio.get_running_loop()
+        messages = asyncio.Queue(maxsize=2)
+        sending = []
         async def emit(receipt):
+            # Runs on the engine loop; the put runs on the caller's loop and blocks there while two
+            # receipts wait. Cancelling this await cancels that put through the wrapped future.
+            put = asyncio.run_coroutine_threadsafe(messages.put(receipt), caller)
+            sending[:] = [put]
+            await asyncio.wrap_future(put)
+        def abandon_put():
+            for put in list(sending):
+                put.cancel()
+        future = self._future(self._stream(token_batches, output_dir, emit))
+        finished = asyncio.wrap_future(future)
+        getter = None
+        try:
             while True:
                 try:
-                    messages.put_nowait(receipt)
-                    return
-                except queue.Full:
-                    await asyncio.sleep(.02)
-        future = self._future(self._stream(token_batches, output_dir, emit))
-        try:
-            while not future.done() or not messages.empty():
-                try:
-                    yield messages.get_nowait()
-                except queue.Empty:
-                    await asyncio.sleep(.02)
-            await asyncio.wrap_future(future)
+                    receipt = messages.get_nowait()
+                except asyncio.QueueEmpty:
+                    if finished.done():
+                        break
+                    getter = asyncio.ensure_future(messages.get())
+                    await asyncio.wait({getter, finished}, return_when=asyncio.FIRST_COMPLETED)
+                    if not getter.done():
+                        getter.cancel()
+                        await asyncio.gather(getter, return_exceptions=True)
+                    if getter.cancelled():
+                        getter = None
+                        continue
+                    receipt, getter = getter.result(), None
+                if finished.done():
+                    abandon_put()  # a put cut short by cancellation must not slip in later
+                yield receipt
+            abandon_put()
+            await finished
         finally:
+            if getter is not None:
+                getter.cancel()
             if not future.done():
                 future.cancel()
                 # The stream owns the worker until canceled tasks have unwound.
@@ -209,6 +230,9 @@ class VLLMExtractor:
                     async with self.lock:
                         pass
                 await asyncio.wrap_future(self._future(barrier()))
+            abandon_put()
+            if finished.done() and not finished.cancelled():
+                finished.exception()  # mark retrieved when the consumer left before awaiting it
 
     async def _extract(self, token_ids):
         tokens = validate_tokens(token_ids)
