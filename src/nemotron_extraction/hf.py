@@ -8,9 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import torch
 from torch import nn
-from .hooks import install
+from .hooks import install, repair_time_step_limits
 from .transport import BufferPool, MEMORY_KEYS, capture_seconds, finish_copy, memory_peaks, publish, timeline
-from .types import ActivationBatch, validate_publication_threads, validate_sites, validate_tokens
+from .types import ActivationBatch, DeviceActivationBatch, validate_publication_threads, validate_sites, validate_tokens
 
 
 def _cuda_device_index(device: torch.device) -> int:
@@ -34,12 +34,7 @@ class HFExtractor:
             model = AutoModelForCausalLM.from_pretrained(
                 model, revision=revision, torch_dtype=dtype, device_map=device,
                 trust_remote_code=trust_remote_code, local_files_only=local_files_only)
-        for module in model.modules():
-            limit = getattr(module, "time_step_limit", None)
-            if isinstance(limit, (tuple, list)) and len(limit) == 2:
-                module.time_step_limit = tuple(
-                    float(item["__float__"]) if isinstance(item, dict) and "__float__" in item else item
-                    for item in limit)
+        repair_time_step_limits(model)
         self.model_load_seconds = time.perf_counter() - started
         self.model = model
         self.device = torch.device(device)

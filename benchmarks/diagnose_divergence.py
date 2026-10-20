@@ -28,7 +28,7 @@ from safetensors.torch import load_file, save_file
 from nemotron_extraction import HFExtractor, VLLMExtractor
 from nemotron_extraction.diagnostics import (TokenDiagnostics, TraceHooks, digest, layers_of,
     runtime_config, write_json)
-from nemotron_extraction.hooks import representative_sites
+from nemotron_extraction.hooks import repair_time_step_limits, representative_sites
 from targeted_validation import Utilisation
 
 MODEL='nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16'
@@ -121,20 +121,12 @@ def replay_spec(args):
     return result
 
 
-def fix_model_config(model):
-    # Same compatibility repair as HFExtractor; never changes numerical values.
-    for module in model.modules():
-        limit=getattr(module,'time_step_limit',None)
-        if isinstance(limit,(tuple,list)) and len(limit)==2:
-            module.time_step_limit=tuple(float(v['__float__']) if isinstance(v,dict) and '__float__' in v else v for v in limit)
-
-
 def transformers_backend(args,rows,manifest,destination,monitor):
     from transformers import AutoModelForCausalLM
     started=time.perf_counter()
     model=AutoModelForCausalLM.from_pretrained(manifest['model_path'],torch_dtype=torch.bfloat16,
         device_map='cuda',trust_remote_code=True,local_files_only=True)
-    fix_model_config(model)
+    repair_time_step_limits(model)
     model.eval()
     result=dict(startup_seconds=time.perf_counter()-started,runtime=runtime_config(model),cases={})
     decoder=getattr(model,'model',model)

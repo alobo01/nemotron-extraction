@@ -75,6 +75,15 @@ def tensor_output(output):
 def residual(hidden: torch.Tensor, running: torch.Tensor | None = None) -> torch.Tensor:
     return hidden.detach().clone() if running is None else (hidden + running).detach()
 
+def repair_time_step_limits(model: nn.Module) -> None:
+    """Decode JSON-serialized float limits in remote Nemotron configs; values are unchanged."""
+    for module in model.modules():
+        limit = getattr(module, "time_step_limit", None)
+        if isinstance(limit, (tuple, list)) and len(limit) == 2:
+            module.time_step_limit = tuple(
+                float(item["__float__"]) if isinstance(item, dict) and "__float__" in item else item
+                for item in limit)
+
 def install(model, sites, captured, *, worker=False, capture_events=None):
     """Capture detached GPU copies; callers move them only after the forward pass."""
     handles, topology = [], {}
