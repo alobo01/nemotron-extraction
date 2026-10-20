@@ -5,14 +5,14 @@ import threading
 import time
 import uuid
 from dataclasses import asdict
-from pathlib import Path
 import torch
 from safetensors.torch import load_file
-from .transport import MEMORY_KEYS
-from .types import ActivationBatch, validate_publication_threads, validate_sites, validate_tokens
+from .extractor import Extractor
+from .transport import SLOTS
+from .types import ActivationBatch, validate_tokens
 
 
-class VLLMExtractor:
+class VLLMExtractor(Extractor):
     """Persistent AsyncLLM workers with two in-flight capture/publication slots."""
     _worker_extension_cls = "nemotron_extraction.worker.ActivationHookExtension"
 
@@ -20,26 +20,17 @@ class VLLMExtractor:
                  sequences_per_call=4, dtype="bfloat16", trust_remote_code=True,
                  enable_chunked_prefill=False, sink_dir=None, gpu_memory_utilization=0.96,
                  kv_cache_memory_bytes=None, diagnostics=False, publication_threads=1):
-        self.sites = validate_sites(sites)
-        self.diagnostics = diagnostics
-        self.publication_threads = validate_publication_threads(publication_threads)
+        super().__init__(sites, diagnostics, publication_threads)
         if sequences_per_call < 1 or max_model_len < 2 or not 0 < gpu_memory_utilization <= 1:
             raise ValueError("Invalid sequence batch size, model length or memory utilization")
         self.sequences_per_call, self.max_model_len = sequences_per_call, max_model_len
         self.enable_chunked_prefill = enable_chunked_prefill
-        self.closed, self.llm, self.installed = False, None, False
+        self.llm, self.installed = None, False
         self.gpu_memory_utilization = gpu_memory_utilization
         self.kv_cache_memory_bytes = kv_cache_memory_bytes
         self.engine_startup_seconds = self.hook_install_seconds = 0.0
-        self.generate_seconds = self.worker_forward_seconds = 0.0
-        self.worker_collection_seconds = self.driver_read_seconds = 0.0
-        self.worker_copy_seconds = self.worker_write_seconds = 0.0
-        self.validation_seconds = self.serialization_seconds = self.worker_rpc_seconds = 0.0
-        self.backpressure_seconds = self.final_drain_seconds = 0.0
-        self.peak_gpu_memory_bytes = self.peak_gpu_reserved_bytes = self.peak_device_memory_bytes = 0
-        self.total_device_memory_bytes = 0
-        self.peak_device_memory_fraction = 0.0
-        self.actual_forward_batches = []
+        self.generate_seconds = self.worker_forward_seconds = self.worker_collection_seconds = 0.0
+        self.worker_copy_seconds = self.worker_rpc_seconds = 0.0
         self.failed = False
         self.tasks = set()
         self.sink = tempfile.TemporaryDirectory(prefix="nemotron-hooks-", dir=sink_dir)
@@ -93,8 +84,7 @@ class VLLMExtractor:
             self.serialization_seconds += receipt["serialization_seconds"]
             self.worker_forward_seconds += receipt["worker_forward_seconds"]
             self.actual_forward_batches.extend(receipt["actual_forward_batches"])
-            for name in MEMORY_KEYS:
-                setattr(self, name, max(getattr(self, name), receipt[name]))
+            self._fold_memory(receipt)
         return ready
 
     async def _generate(self, tokens, ids):
@@ -154,9 +144,9 @@ class VLLMExtractor:
                 if tokens.shape[1] + 1 > self.max_model_len:
                     raise ValueError("Prompt plus one generated token exceeds max_model_len")
                 for chunk in tokens.split(self.sequences_per_call):
-                    if len(pending) >= 2:
-                        self.backpressure_seconds += await drain(1)
-                    path = Path(output_dir) / f"{index:06d}.safetensors"
+                    if len(pending) >= SLOTS:
+                        self.backpressure_seconds += await drain(SLOTS - 1)
+                    path = self.shard_path(output_dir, index)
                     if path.exists():
                         raise FileExistsError(path)
                     wave_id = f"{namespace}-{index}"
@@ -180,7 +170,7 @@ class VLLMExtractor:
     async def stream_to_disk(self, token_batches, output_dir):
         """Yield ordered durable shard receipts; two publications may overlap inference."""
         caller = asyncio.get_running_loop()
-        messages = asyncio.Queue(maxsize=2)
+        messages = asyncio.Queue(maxsize=SLOTS)
         sending = []
         async def emit(receipt):
             # Runs on the engine loop; the put runs on the caller's loop and blocks there while two
@@ -246,8 +236,7 @@ class VLLMExtractor:
             return ActivationBatch(tokens, {key: torch.cat(values) for key, values in parts.items()})
 
     def _submit_extract(self, token_ids):
-        if self.closed:
-            raise RuntimeError("Extractor is closed")
+        self._require_open()
         return self._future(self._extract(token_ids))
 
     def extract(self, token_ids):
@@ -280,9 +269,3 @@ class VLLMExtractor:
             self.thread.join()
             self.loop.close()
             self.sink.cleanup()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()

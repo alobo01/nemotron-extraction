@@ -28,6 +28,7 @@ from nemotron_extraction import HFExtractor, VLLMExtractor
 from nemotron_extraction.diagnostics import (TokenDiagnostics, TraceHooks, digest,
     runtime_config, write_json)
 from nemotron_extraction.hooks import repair_time_step_limits
+from nemotron_extraction.transport import SLOTS
 from targeted_validation import Utilisation
 
 MODEL='nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16'
@@ -327,14 +328,14 @@ class IntegrityHFExtractor(HFExtractor):
             self.oracles[self.diag_slot]={k:v.detach().reshape(-1,v.shape[-1]).clone().cpu() for k,v in self.captured.items()}
         self.handles.append(decoder.register_forward_hook(oracle))
 
-    def _capture_locked(self,tokens,slot):
+    def _capture(self,tokens,slot):
         self.diag_slot=slot
-        return super()._capture_locked(tokens,slot)
+        return super()._capture(tokens,slot)
 
     def _publish(self,tokens,slot,capture,path,index):
         oracle=self.oracles.pop(slot)
-        occupied=2-len(self.pool.free)
-        time.sleep(.5)
+        occupied=SLOTS-len(self.pool.free)
+        time.sleep(.5)  # hold this slot so the next capture fills the other buffer
         result=super()._publish(tokens,slot,capture,path,index)
         saved=load_file(result['path'])
         exact=torch.equal(saved['token_ids'],tokens) and all(torch.equal(saved[k],v) for k,v in oracle.items())

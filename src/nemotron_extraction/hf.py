@@ -5,13 +5,14 @@ import threading
 import time
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from contextlib import contextmanager
 from typing import NamedTuple
 import torch
 from torch import nn
+from .extractor import Extractor
 from .hooks import install, repair_time_step_limits
-from .transport import BufferPool, MEMORY_KEYS, capture_seconds, finish_copy, memory_peaks, publish, timeline
-from .types import ActivationBatch, DeviceActivationBatch, validate_publication_threads, validate_sites, validate_tokens
+from .transport import SLOTS, BufferPool, capture_seconds, finish_copy, memory_peaks, publish, timeline
+from .types import ActivationBatch, DeviceActivationBatch, validate_tokens
 
 
 def _cuda_device_index(device: torch.device) -> int:
@@ -27,15 +28,12 @@ class Capture(NamedTuple):
     capture_events: tuple
 
 
-class HFExtractor:
+class HFExtractor(Extractor):
     """Eager PyTorch reference; accepts a model ID or a caller-owned nn.Module."""
     def __init__(self, model, sites, *, revision=None, device="cuda", dtype=torch.bfloat16,
                  trust_remote_code=True, local_files_only=False, diagnostics=False,
                  publication_threads=1):
-        self.diagnostics = diagnostics
-        self.publication_threads = validate_publication_threads(publication_threads)
-        self.sites = validate_sites(sites)
-        self.closed = False
+        super().__init__(sites, diagnostics, publication_threads)
         self.owns_model = not isinstance(model, nn.Module)
         started = time.perf_counter()
         if self.owns_model:
@@ -55,7 +53,6 @@ class HFExtractor:
         self.producer = ThreadPoolExecutor(max_workers=1)
         self.writer = ThreadPoolExecutor(max_workers=publication_threads)
         self.metrics_lock = threading.Lock()
-        self.validation_seconds = self.serialization_seconds = 0.0
         self.copy_worker = ThreadPoolExecutor(max_workers=1)
         self.capture_lock = threading.Lock()
         self.stream_lock = threading.Lock()
@@ -66,12 +63,6 @@ class HFExtractor:
             self.origin.record()
             torch.cuda.synchronize(self.device)
         self.origin_cpu = time.perf_counter()
-        self.worker_write_seconds = self.backpressure_seconds = self.final_drain_seconds = 0.0
-        self.driver_read_seconds = 0.0
-        self.actual_forward_batches = []
-        self.peak_gpu_memory_bytes = self.peak_gpu_reserved_bytes = self.peak_device_memory_bytes = 0
-        self.total_device_memory_bytes = 0
-        self.peak_device_memory_fraction = 0.0
         started = time.perf_counter()
         try:
             self.handles, self.topology = install(model, self.sites, self.captured,
@@ -82,8 +73,7 @@ class HFExtractor:
             raise
 
     def extract(self, token_ids):
-        if self.closed:
-            raise RuntimeError("Extractor is closed")
+        self._require_open()
         tokens = validate_tokens(token_ids)
         if not self.stream_lock.acquire(blocking=False):
             raise RuntimeError("Another extraction stream is active")
@@ -104,46 +94,39 @@ class HFExtractor:
         The returned detached CUDA tensors own their storage. Callers retain
         them until asynchronous peer transfers and local consumers complete.
         """
-        if self.closed:
-            raise RuntimeError("Extractor is closed")
+        self._require_open()
         tokens = validate_tokens(token_ids)
         if not self.stream_lock.acquire(blocking=False):
             raise RuntimeError("Another extraction stream is active")
         try:
-            with self.capture_lock:
-                self.captured.clear()
-                was_training = self.model.training
-                self.model.eval()
-                try:
-                    decoder = getattr(self.model, "backbone", None)
-                    if decoder is None:
-                        decoder = getattr(self.model, "model", self.model)
-                    with torch.inference_mode():
-                        decoder(input_ids=tokens.to(self.device), use_cache=False)
-                    return DeviceActivationBatch(tokens, {
-                        site.key: self.captured[site.key].reshape(-1, self.captured[site.key].shape[-1]).clone()
-                        for site in self.sites})
-                finally:
-                    self.captured.clear()
-                    self.model.train(was_training)
+            with self._evaluating() as decoder:
+                with torch.inference_mode():
+                    decoder(input_ids=tokens.to(self.device), use_cache=False)
+                return DeviceActivationBatch(tokens, {
+                    site.key: self.captured[site.key].reshape(-1, self.captured[site.key].shape[-1]).clone()
+                    for site in self.sites})
         finally:
             self.stream_lock.release()
 
-    def _capture(self, tokens, slot):
+    @contextmanager
+    def _evaluating(self):
+        """Hold the capture lock in eval mode; yield the decoder, skipping vocabulary logits."""
         with self.capture_lock:
-            return self._capture_locked(tokens, slot)
-
-    def _capture_locked(self, tokens, slot):
-        self.captured.clear()
-        self.capture_events.clear()
-        copy_events = None
-        was_training = self.model.training
-        try:
-            self.model.eval()
-            with torch.inference_mode():
+            was_training = self.model.training
+            self.captured.clear()
+            try:
+                self.model.eval()
                 decoder = getattr(self.model, "backbone", None)
-                if decoder is None:
-                    decoder = getattr(self.model, "model", self.model)
+                yield decoder if decoder is not None else getattr(self.model, "model", self.model)
+            finally:
+                self.captured.clear()
+                self.model.train(was_training)
+
+    def _capture(self, tokens, slot):
+        copy_events = None
+        with self._evaluating() as decoder:
+            self.capture_events.clear()
+            with torch.inference_mode():
                 inputs = tokens.to(self.device)
                 events = None
                 started = time.perf_counter()
@@ -175,16 +158,13 @@ class HFExtractor:
                     copy_end.record()
                 copied = self.copy_worker.submit(finish_copy, copy_start, copy_end, sources)
                 copy_events = (copy_start, copy_end)
-                self.__dict__.update(memory_peaks({key: getattr(self, key) for key in MEMORY_KEYS}, self.device))
+                self._fold_memory(memory_peaks(device=self.device))
             else:
                 for key, source in sources.items():
                     values[key].copy_(source.reshape(values[key].shape))
                 copied = self.copy_worker.submit(finish_copy, None, None, sources)
             self.actual_forward_batches.append(len(tokens))
             return Capture(values, copied, events, copy_events, tuple(self.capture_events))
-        finally:
-            self.captured.clear()
-            self.model.train(was_training)
 
     def _finish(self, capture):
         seconds = capture.copied.result()
@@ -218,8 +198,7 @@ class HFExtractor:
         return await asyncio.get_running_loop().run_in_executor(self.producer, self.extract, token_ids)
 
     async def stream_to_disk(self, token_batches, output_dir):
-        if self.closed:
-            raise RuntimeError("Extractor is closed")
+        self._require_open()
         if not self.stream_lock.acquire(blocking=False):
             raise RuntimeError("Another extraction stream is active")
         pending = []
@@ -227,15 +206,14 @@ class HFExtractor:
         try:
             for index, batch in enumerate(token_batches):
                 tokens = validate_tokens(batch)
-                if len(pending) >= 2:
+                if len(pending) >= SLOTS:
                     started = time.perf_counter()
                     receipt = await asyncio.shield(asyncio.wrap_future(pending[0]))
                     pending.pop(0)
                     yield receipt
                     self.backpressure_seconds += time.perf_counter() - started
+                # Draining above released the oldest slot, so one is always free here.
                 slot = self.pool.acquire()
-                if slot is None:
-                    raise RuntimeError("Capture admission violated the two-slot bound")
                 try:
                     # Shield CUDA submissions: cancellation must not release a live slot.
                     job = loop.run_in_executor(self.producer, self._capture, tokens, slot)
@@ -246,7 +224,7 @@ class HFExtractor:
                         await asyncio.to_thread(self._finish, capture)
                         raise
                     pending.append(self.writer.submit(self._publish, tokens, slot, capture,
-                                                       Path(output_dir) / f"{index:06d}.safetensors", index))
+                                                       self.shard_path(output_dir, index), index))
                 except BaseException:
                     self.pool.release(slot)
                     raise
@@ -285,9 +263,3 @@ class HFExtractor:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()

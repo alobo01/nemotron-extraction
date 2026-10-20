@@ -10,13 +10,15 @@ from safetensors.torch import save_file
 
 MEMORY_KEYS = ("peak_gpu_memory_bytes", "peak_gpu_reserved_bytes", "peak_device_memory_bytes",
                "total_device_memory_bytes", "peak_device_memory_fraction")
+# One capture being filled while the previous one is written.
+SLOTS = 2
 
 
 class BufferPool:
-    """Two slots; release only after a consumer finishes."""
+    """Release a slot only after its consumer finishes."""
     def __init__(self):
-        self.slots = [{}, {}]
-        self.free = [0, 1]
+        self.slots = [{} for _ in range(SLOTS)]
+        self.free = list(range(SLOTS))
         self.lock = threading.Lock()
 
     def acquire(self):
@@ -40,7 +42,7 @@ class BufferPool:
     def reset(self):
         """Only call once transfers and writers have drained; no slot can still be read."""
         with self.lock:
-            self.free = [0, 1]
+            self.free = list(range(SLOTS))
             for slot in self.slots:
                 slot.clear()
 
