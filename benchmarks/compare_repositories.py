@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["nemotron-extraction[hf,vllm,benchmark]==1.0.0"]
+# dependencies = ["nemotron-extraction[hf,vllm,benchmark]==1.1.0"]
 # ///
 """Compare installed hooks with unchanged sibling file/fill extraction methods.
 
@@ -24,7 +24,7 @@ import traceback
 import torch
 from safetensors.torch import load_file, save_file
 from nemotron_extraction import HFExtractor, HookSite, VLLMExtractor
-from nemotron_extraction import diagnostics
+from benchlib.sibling import sibling_namespace as load_sibling
 from nemotron_extraction.hooks import representative_sites, resolve
 from targeted_validation import Utilisation, overlap_seconds
 from validate import Agreement, MODEL, batches, sha256, versions, write_json
@@ -46,7 +46,7 @@ def configured_chunked_prefill():
 
 def sibling_namespace(directory):
     """Retain original function/class bodies; exclude unrelated package imports."""
-    scope = diagnostics.sibling_namespace(directory)
+    scope = load_sibling(directory)
     required = ("sae_install_hooks", "_sae_end_step", "sae_save", "sae_flush_saves", "sae_flush")
     if not all(hasattr(scope["ActivationHookExtension"], name) for name in required):
         raise ValueError("Sibling source lacks the expected file/fill interface")

@@ -1,7 +1,5 @@
 """Numerical diagnostics must distinguish computation, identity and transport."""
 import json
-from pathlib import Path
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -9,11 +7,10 @@ import torch
 from torch import nn
 from safetensors.torch import load_file
 
-from nemotron_extraction.diagnostics import TokenDiagnostics, TraceHooks, DiagnosticWorker, runtime_config
-from nemotron_extraction.moe_diagnostics import (four_way_replay, manual_nemotron_moe,
-    manual_sigmoid_router, routing_report)
-
-sys.path.insert(0,str(Path(__file__).parents[1]/'benchmarks'))
+from benchlib.moe import manual_nemotron_moe, manual_sigmoid_router, routing_report
+from benchlib.stats import TokenDiagnostics
+from benchlib.trace import TraceHooks, runtime_config
+from benchlib.workers import DiagnosticWorker
 import diagnose_divergence as diagnostic
 
 
@@ -173,13 +170,9 @@ def test_router_report_uses_observed_ids_and_reports_selection_margin():
     logits=torch.tensor([[3.,2.,1.,0.],[0.,1.,2.,3.]])
     bias=torch.tensor([0.,0.,0.,0.])
     ids=torch.tensor([[0,1],[3,2]])
-    probs=logits.sigmoid()
-    weights=probs.gather(1,ids);weights=weights/weights.sum(1,keepdim=True)
-    report=routing_report(logits,bias,ids,weights)
+    report=routing_report(logits,bias,ids)
     assert report['unconstrained_set_agreement'].tolist()==[True,True]
     assert torch.all(report['global_sixth_seventh_margin']>0)
-    assert torch.equal(report['selected_ids'],ids)
-    assert torch.allclose(report['normalized_sigmoid_weights'],weights)
 
 
 def test_manual_sigmoid_router_uses_correction_for_selection_only():
@@ -212,18 +205,6 @@ def test_manual_nemotron_moe_matches_explicit_non_gated_equations():
             ref[row]+=out[0]*(weights[row,slot]*2.5)
     ref=ref+torch.nn.functional.linear(torch.relu(torch.nn.functional.linear(x,shared_up)).square(),shared_down)
     assert torch.allclose(result['output'],ref)
-    assert torch.allclose(result['weighted_slot_contributions'].sum(1),result['routed_float32'])
-
-
-def test_four_way_replay_separates_input_and_implementation_effects():
-    xh=torch.tensor([[1.,2.],[-1.,3.]])
-    xv=xh+torch.tensor([[.1,0.],[0.,-.2]])
-    ref=lambda x: x.square()
-    candidate=lambda x: x.square()+torch.tensor([[0.,.3],[.2,0.]])
-    values=four_way_replay(xh,xv,ref,candidate)
-    assert torch.equal(values['reconstruction_error'],torch.zeros_like(xh))
-    assert torch.equal(values['input_effect'],ref(xv)-ref(xh))
-    assert torch.equal(values['implementation_effect_on_candidate_input'],candidate(xv)-ref(xv))
 
 
 def test_anchor_rule_is_reported_alongside_unchanged_strict_gates():

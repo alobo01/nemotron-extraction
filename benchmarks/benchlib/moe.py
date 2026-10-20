@@ -1,15 +1,13 @@
-"""Equation-level diagnostics for Nemotron's non-gated mixture of experts.
+"""Transparent PyTorch equations for Nemotron's non-gated mixture of experts.
 
-These helpers are intentionally separate from extraction and inference paths.
-They expose routing discontinuities and provide a transparent PyTorch replay
-for an unquantized, non-gated expert layer.
+They expose routing discontinuities and replay an unquantized expert layer.
 """
 from __future__ import annotations
 
-from collections.abc import Callable
-
 import torch
 import torch.nn.functional as F
+
+from .stats import same_expert_sets
 
 
 def manual_sigmoid_router(hidden_states, gate_weight, correction_bias, top_k,
@@ -29,45 +27,29 @@ def manual_sigmoid_router(hidden_states, gate_weight, correction_bias, top_k,
             'normalized_weights':weights}
 
 
-def routing_report(logits, correction_bias, selected_ids, selected_weights):
+def routing_report(logits, correction_bias, selected_ids):
     """Summarize observed routing without assuming how grouped top-k is encoded.
 
-    ``selected_ids`` and ``selected_weights`` come from the backend's actual
-    selector. Margins are measured against the global corrected sigmoid score;
-    they are diagnostic only when grouped routing restricts eligibility.
+    ``selected_ids`` come from the backend's actual selector. Margins are measured
+    against the global corrected sigmoid score; they are diagnostic only when
+    grouped routing restricts eligibility.
     """
-    scores = torch.sigmoid(logits.float())
-    corrected = scores + correction_bias.float()
+    corrected = torch.sigmoid(logits.float()) + correction_bias.float()
     ids = selected_ids.long()
-    weights = selected_weights.float()
-    if ids.ndim != 2 or weights.shape != ids.shape or logits.shape[0] != ids.shape[0]:
+    if ids.ndim != 2 or logits.shape[0] != ids.shape[0]:
         raise ValueError("Expected [tokens, experts] logits and matching [tokens, top_k] routes")
     if bool(((ids < 0) | (ids >= logits.shape[-1])).any()):
         raise ValueError("Selected expert ID is outside the router output range")
 
     rows = torch.arange(ids.shape[0], device=ids.device)[:, None]
-    selected_corrected = corrected[rows, ids]
     excluded = torch.ones_like(corrected, dtype=torch.bool)
     excluded.scatter_(1, ids, False)
-    worst_selected = selected_corrected.min(dim=1).values
+    worst_selected = corrected[rows, ids].min(dim=1).values
     best_excluded = corrected.masked_fill(~excluded, -torch.inf).max(dim=1).values
-    margins = worst_selected - best_excluded
-    k = ids.shape[1]
-    unconstrained = corrected.topk(k, dim=-1).indices
-    agree = torch.sort(ids, dim=-1).values == torch.sort(unconstrained, dim=-1).values
-    chosen_scores = scores[rows, ids]
-    normalized = chosen_scores / chosen_scores.sum(dim=1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
+    unconstrained = corrected.topk(ids.shape[1], dim=-1).indices
     return {
-        "router_logits": logits.detach(),
-        "sigmoid_scores": scores.detach(),
-        "corrected_scores": corrected.detach(),
-        "selected_ids": ids.detach(),
-        "selected_weights": weights.detach(),
-        "selected_scores_before_normalization": chosen_scores.detach(),
-        "normalized_sigmoid_weights": normalized.detach(),
-        "global_sixth_seventh_margin": margins.detach(),
-        "unconstrained_topk_ids": unconstrained.detach(),
-        "unconstrained_set_agreement": agree.all(dim=1).detach(),
+        "global_sixth_seventh_margin": (worst_selected - best_excluded).detach(),
+        "unconstrained_set_agreement": same_expert_sets(ids, unconstrained).detach(),
     }
 
 
@@ -81,8 +63,6 @@ def manual_nemotron_moe(
     shared_up_weight=None,
     shared_down_weight=None,
     routed_scale=1.0,
-    up_bias=None,
-    down_bias=None,
     shared_up_bias=None,
     shared_down_bias=None,
     output_dtype=None,
@@ -110,20 +90,15 @@ def manual_nemotron_moe(
 
     dtype = output_dtype or x.dtype
     routed = torch.zeros((x.shape[0], x.shape[1]), device=x.device, dtype=torch.float32)
-    per_slot = torch.zeros((x.shape[0], ids.shape[1], x.shape[1]), device=x.device, dtype=torch.float32)
     # The frozen Transformers source iterates expert IDs, not top-k slots.
     # Preserve this addition order and the per-expert GEMM row grouping.
     for expert in range(up_weight.shape[0]):
         rows, slots = torch.where(ids == expert)
         if not rows.numel():
             continue
-        up = F.linear(x.index_select(0, rows), up_weight[expert],
-                      None if up_bias is None else up_bias[expert])
-        out = F.linear(F.relu(up).square(), down_weight[expert],
-                       None if down_bias is None else down_bias[expert])
-        contribution = out * (weights[rows, slots] * float(routed_scale))[:, None]
-        routed.index_add_(0, rows, contribution)
-        per_slot[rows, slots] = contribution
+        up = F.linear(x.index_select(0, rows), up_weight[expert])
+        out = F.linear(F.relu(up).square(), down_weight[expert])
+        routed.index_add_(0, rows, out * (weights[rows, slots] * float(routed_scale))[:, None])
 
     routed_cast = routed.to(dtype)
     shared = None
@@ -133,28 +108,8 @@ def manual_nemotron_moe(
         shared_hidden = F.linear(x, shared_up_weight, shared_up_bias)
         shared = F.linear(F.relu(shared_hidden).square(), shared_down_weight, shared_down_bias)
     output = routed_cast if shared is None else routed_cast + shared.to(dtype)
-    return {
-        "output": output,
-        "routed_float32": routed,
-        "routed_cast": routed_cast,
-        "shared_output": shared,
-        "weighted_slot_contributions": per_slot,
-    }
+    return {"output": output, "routed_cast": routed_cast}
 
-
-def four_way_replay(reference_input, candidate_input, reference_op: Callable, candidate_op: Callable):
-    """Evaluate both implementations on both inputs and separate effects.
-
-    The exact decomposition is ``candidate(candidate_input)-reference(reference_input)``
-    = input effect ``reference(candidate_input)-reference(reference_input)`` +
-    implementation effect ``candidate(candidate_input)-reference(candidate_input)``.
-    The crossed candidate-on-reference result is retained to expose interaction.
-    """
-    hh = reference_op(reference_input)
-    hv = reference_op(candidate_input)
-    vh = candidate_op(reference_input)
-    vv = candidate_op(candidate_input)
-    return decompose_four_outputs(hh, hv, vh, vv)
 
 
 def decompose_four_outputs(reference_on_reference, reference_on_candidate,
@@ -165,13 +120,8 @@ def decompose_four_outputs(reference_on_reference, reference_on_candidate,
     hh,hv,vh,vv=(value.float() for value in (reference_on_reference,
         reference_on_candidate,candidate_on_reference,candidate_on_candidate))
     return {
-        "reference_on_reference_input": hh,
-        "reference_on_candidate_input": hv,
-        "candidate_on_reference_input": vh,
-        "candidate_on_candidate_input": vv,
         "input_effect": hv - hh,
         "implementation_effect_on_candidate_input": vv - hv,
         "implementation_effect_on_reference_input": vh - hh,
         "interaction_effect": (vv - vh) - (hv - hh),
-        "reconstruction_error": (vv - hh) - ((hv - hh) + (vv - hv)),
     }

@@ -15,9 +15,10 @@ from torch import nn
 import torch.nn.functional as F
 from safetensors import safe_open
 
+from nemotron_extraction.hooks import layers_of
 
-def tensor_digest(value):
-    return hashlib.sha256(value.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
+from .common import tensor_digest, write_json
+from .stats import TokenDiagnostics
 
 
 def fp32_backends():
@@ -97,7 +98,6 @@ class PrecisionWorker:
     """Standalone worker for aligned, layer-1 expert validation only."""
 
     def precision_prepare(self, model_path, source_path, source_sha256):
-        from .hooks import layers_of
         model_path = Path(model_path)
         config = json.loads((model_path / 'config.json').read_text())
         if config['n_group'] != 1 or config['topk_group'] != 1 or config['num_experts_per_tok'] != 6:
@@ -166,7 +166,6 @@ class PrecisionWorker:
 
     def precision_case(self, transformer_trace, vllm_trace, length, name, output_dir, reverse_duplicate=False):
         from vllm.forward_context import set_forward_context
-        from .diagnostics import TokenDiagnostics, write_json
         reference, mixer = self.precision_reference, self.precision_mixer
         device = reference.gate.weight.device
         traces = []
@@ -209,10 +208,11 @@ class PrecisionWorker:
             summary = metric.result()
             summary['rows_cosine_at_least_0_990'] = sum(row['cosine'] >= .990 for row in metric.rows)
             summary['anchor_99_percent_rule'] = summary['rows_cosine_at_least_0_990'] / len(metric.rows) >= .99
+            summary['required_for_aligned_operator_acceptance'] = required
             write_json(path / (label + '.json'), dict(summary=summary, rows=metric.rows))
             samples = path / (label + '.safetensors')
             metric.save_samples(samples)
-            # Independently verify the persisted diagnostic tensors are finite.
+            # Read the samples back to prove they persisted unchanged.
             with safe_open(str(samples), framework='pt') as file:
                 for i, row_id in enumerate(sorted(metric.samples)):
                     for j, side in enumerate(('reference', 'candidate')):
@@ -221,7 +221,6 @@ class PrecisionWorker:
                         if restored.dtype != expected.dtype or restored.shape != expected.shape or not torch.equal(restored, expected):
                             raise ValueError('Persisted diagnostic sample changed')
             result['comparisons'][label] = summary
-            summary['required_for_aligned_operator_acceptance'] = required
             if required:
                 result['strict_pass'] &= summary['passed']
 
@@ -240,7 +239,7 @@ class PrecisionWorker:
                              ('vllm_input', traces[1], tokens, torch.arange(length))]
                 outputs = []
                 for label, x, row_tokens, positions in cases:
-                    reference_ids, reference_weights = reference.gate(x)
+                    reference_ids, _ = reference.gate(x)
                     reference_logits = F.linear(x.float(), reference.gate.weight)
                     # Warm both complete operator shapes before collecting timed calls.
                     mixer.gate.forward = aligned_gate

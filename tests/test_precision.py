@@ -1,10 +1,9 @@
 import hashlib
-from pathlib import Path
 
 import pytest
 import torch
 
-from nemotron_extraction.precision import checkpoint_source_reference, ieee_precision, precision_settings
+from benchlib.precision import checkpoint_source_reference, ieee_precision, precision_settings
 
 
 def test_ieee_precision_restores_state_after_failure():
@@ -54,8 +53,6 @@ class NemotronHMOE(nn.Module):
 
 
 def test_final_validation_requires_every_precision_and_probe_check():
-    import sys
-    sys.path.insert(0, str(Path(__file__).parents[1] / 'benchmarks'))
     from precision_validation import gate_passed
     result = dict(strict_pass=True, exact_router_logits=True,
                   expert_sets_equal=True, persisted_samples_exact=True)
@@ -66,7 +63,7 @@ def test_final_validation_requires_every_precision_and_probe_check():
 
 
 def test_worst_one_percent_reports_extremes_and_merges_without_changing_ranking():
-    from nemotron_extraction.diagnostics import TokenDiagnostics
+    from benchlib.stats import TokenDiagnostics
     a = torch.ones(101, 2)
     b = a.clone()
     b[7] *= -1
@@ -89,7 +86,7 @@ def test_worst_one_percent_reports_extremes_and_merges_without_changing_ranking(
 
 
 def test_reference_accumulation_preserves_expert_order_under_cancellation():
-    from nemotron_extraction.moe_diagnostics import manual_nemotron_moe
+    from benchlib.moe import manual_nemotron_moe
     x = torch.ones(1, 1)
     up = torch.ones(3, 1, 1)
     down = torch.tensor([1e8, -1e8, 1.]).reshape(3, 1, 1)

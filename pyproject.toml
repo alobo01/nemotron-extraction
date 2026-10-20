@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nemotron-extraction"
-version = "1.0.0"
+version = "1.1.0"
 authors = [{name = "Antonio Lobo-Santos"}]
 description = "Small, token-aligned activation hooks for Nemotron in PyTorch and vLLM"
 readme = "README.md"

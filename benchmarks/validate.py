@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["nemotron-extraction[hf,vllm,benchmark]==1.0.0"]
+# dependencies = ["nemotron-extraction[hf,vllm,benchmark]==1.1.0"]
 # ///
 """Single-file benchmark: prepare frozen inputs and compare both backends.
 
@@ -22,7 +22,7 @@ import time
 import torch
 from safetensors.torch import load_file, save_file
 from nemotron_extraction import HFExtractor, VLLMExtractor, HookSite
-from nemotron_extraction.diagnostics import digest as sha256, write_json
+from benchlib.common import digest as sha256, write_json
 from nemotron_extraction.hooks import representative_sites
 
 MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"

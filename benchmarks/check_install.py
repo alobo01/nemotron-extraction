@@ -4,8 +4,6 @@ import inspect
 from pathlib import Path
 import nemotron_extraction
 from nemotron_extraction.worker import ActivationHookExtension
-from nemotron_extraction.diagnostics import DiagnosticWorker, IntegrityWorker
-assert DiagnosticWorker.diag_install and IntegrityWorker.nh_install
 
 print("package:", Path(nemotron_extraction.__file__).resolve())
 print("worker:", ActivationHookExtension.__module__)

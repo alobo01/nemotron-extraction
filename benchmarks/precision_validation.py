@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["nemotron-extraction[vllm,benchmark]==1.0.0"]
+# dependencies = ["nemotron-extraction[vllm,benchmark]==1.1.0"]
 # ///
 """Same-runtime layer-1 operator validation; full anchor is gated by a short probe.
 
@@ -21,8 +21,8 @@ import traceback
 import torch
 from safetensors import safe_open
 
-from nemotron_extraction.diagnostics import digest, write_json
-from nemotron_extraction.precision import ieee_precision
+from benchlib.common import digest, write_json
+from benchlib.precision import ieee_precision
 from targeted_validation import Utilisation
 from diagnose_divergence import ANCHOR_SHA256, inputs, software
 
@@ -58,7 +58,7 @@ async def run(args):
         enable_chunked_prefill=True, max_model_len=2049, max_num_seqs=1,
         max_num_batched_tokens=2049, skip_tokenizer_init=True, gpu_memory_utilization=.96,
         mamba_cache_dtype='bfloat16', mamba_ssm_cache_dtype='float32',
-        worker_extension_cls='nemotron_extraction.precision.PrecisionWorker')
+        worker_extension_cls='benchlib.precision.PrecisionWorker')
     engine = None
     begun = time.perf_counter()
     try:

@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["nemotron-extraction==1.0.0"]
+# dependencies = ["nemotron-extraction==1.1.0"]
 # ///
 """Aggregate aligned range receipts into exactly 1M validated tokens/language."""
 import argparse

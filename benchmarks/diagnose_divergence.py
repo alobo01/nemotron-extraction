@@ -1,8 +1,8 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["nemotron-extraction[hf,vllm,benchmark]==1.0.0"]
+# dependencies = ["nemotron-extraction[hf,vllm,benchmark]==1.1.0"]
 # ///
-"""Bounded numerical investigation (install a wheel containing diagnostics first).
+"""Bounded numerical investigation of where the two backends diverge.
 
 uv run --no-project --with /path/to/wheel.whl diagnose_divergence.py --help
 Run inspect, backend/integrity, analyse, then backend --replay-selection and
@@ -25,8 +25,9 @@ import traceback
 import torch
 from safetensors.torch import load_file, save_file
 from nemotron_extraction import HFExtractor, VLLMExtractor
-from nemotron_extraction.diagnostics import (TokenDiagnostics, TraceHooks, digest,
-    runtime_config, write_json)
+from benchlib.common import digest, write_json
+from benchlib.stats import TokenDiagnostics
+from benchlib.trace import TraceHooks, runtime_config
 from nemotron_extraction.hooks import repair_time_step_limits
 from nemotron_extraction.transport import SLOTS
 from targeted_validation import Utilisation
@@ -178,7 +179,7 @@ async def vllm_backend(args,rows,manifest,destination,monitor):
         enforce_eager=True,enable_prefix_caching=False,enable_chunked_prefill=not args.no_chunked_prefill,
         max_model_len=2049,max_num_seqs=64,max_num_batched_tokens=64*2049,
         skip_tokenizer_init=True,gpu_memory_utilization=.96,
-        worker_extension_cls='nemotron_extraction.diagnostics.DiagnosticWorker')
+        worker_extension_cls='benchlib.workers.DiagnosticWorker')
     engine=AsyncLLM.from_engine_args(AsyncEngineArgs(**config))
     result=dict(startup_seconds=time.perf_counter()-started,engine_configuration=config,cases={})
     installed=False
@@ -257,7 +258,7 @@ async def moe_replay(args):
         tensor_parallel_size=1,enforce_eager=True,enable_prefix_caching=False,
         enable_chunked_prefill=False,max_model_len=2049,max_num_seqs=1,
         max_num_batched_tokens=2049,skip_tokenizer_init=True,gpu_memory_utilization=.96,
-        worker_extension_cls='nemotron_extraction.diagnostics.DiagnosticWorker')
+        worker_extension_cls='benchlib.workers.DiagnosticWorker')
     engine=AsyncLLM.from_engine_args(AsyncEngineArgs(**engine_config))
     output=args.output/'layer1-moe-replay.safetensors'
     try:
@@ -315,7 +316,7 @@ async def moe_replay(args):
 
 
 class IntegrityExtractor(VLLMExtractor):
-    _worker_extension_cls='nemotron_extraction.diagnostics.IntegrityWorker'
+    _worker_extension_cls='benchlib.workers.IntegrityWorker'
 
 
 class IntegrityHFExtractor(HFExtractor):

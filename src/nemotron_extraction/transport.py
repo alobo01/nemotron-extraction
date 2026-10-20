@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -82,24 +83,32 @@ def memory_peaks(previous=None, device=None):
     return {key: max(value, previous.get(key, 0)) for key, value in current.items()}
 
 
+@contextmanager
+def atomic_path(path):
+    """Yield a temporary sibling path that replaces ``path`` only if the block succeeds."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_suffix(path.suffix + ".partial")
+    try:
+        yield partial
+        partial.replace(path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+
+
 def publish(tensors, path, metadata=None):
     path = Path(path)
     if path.exists():
         raise FileExistsError(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.with_suffix(path.suffix + ".partial")
     started = time.perf_counter()
-    try:
+    with atomic_path(path) as partial:
         for key, tensor in tensors.items():
             if tensor.is_floating_point() and not bool(torch.isfinite(tensor).all()):
                 raise ValueError(f"{key}: nonfinite activations")
         validated = time.perf_counter()
         save_file(tensors, str(partial), metadata=metadata)
         serialized = time.perf_counter()
-        partial.replace(path)
-    except BaseException:
-        partial.unlink(missing_ok=True)
-        raise
     finished = time.perf_counter()
     return {"path": str(path), "bytes": path.stat().st_size,
             "validation_seconds": validated - started,

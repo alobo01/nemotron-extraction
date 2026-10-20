@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["nemotron-extraction[hf,vllm,benchmark]==1.0.0"]
+# dependencies = ["nemotron-extraction[hf,vllm,benchmark]==1.1.0"]
 # ///
 """Focused extraction benchmark. Install the selected frozen wheel with uv first.
 

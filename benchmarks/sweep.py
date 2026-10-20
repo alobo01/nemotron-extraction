@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["nemotron-extraction[hf,vllm,benchmark]==1.0.0"]
+# dependencies = ["nemotron-extraction[hf,vllm,benchmark]==1.1.0"]
 # ///
 """Reusable backend phase for a three-language, asynchronous batch-size sweep.
 
