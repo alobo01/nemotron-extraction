@@ -28,7 +28,12 @@ from .worker import ActivationHookExtension, external_request_id
 
 
 def digest(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    """Stream the file so multi-gigabyte shards are never read into memory at once."""
+    result = hashlib.sha256()
+    with Path(path).open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b''):
+            result.update(chunk)
+    return result.hexdigest()
 
 
 def write_json(path, value):
