@@ -11,7 +11,6 @@ from safetensors.torch import save_file
 from nemotron_extraction import ActivationBatch, HFExtractor, HookSite, VLLMExtractor
 from nemotron_extraction.hf import _cuda_device_index
 from nemotron_extraction.hooks import install, representative_sites
-from nemotron_extraction.worker import assemble_rows
 
 
 class TinyMamba(nn.Module):
@@ -137,21 +136,6 @@ def test_vllm_split_residual_and_input_mutation():
     assert torch.equal(captured["L0_resid_post"], torch.tensor([[7., 11.]]))
     for handle in handles:
         handle.remove()
-
-
-def test_packed_rows_reordering_duplicates_and_decode_exclusion():
-    tokens = torch.tensor([[1, 2], [3, 4], [1, 2]])
-    steps = [{"input_ids": torch.tensor([3, 4, 1, 2]), "positions": torch.tensor([0, 1, 0, 1]),
-              "site": torch.tensor([[30.], [40.], [10.], [20.]])},
-             {"input_ids": torch.tensor([1, 2, 99]), "positions": torch.tensor([0, 1, 2]),
-              "site": torch.tensor([[11.], [21.], [99.]])}]
-    # A decode row is in a separate engine step; it must never enter prompt output.
-    steps[1] = {key: value[:2] for key, value in steps[1].items()}
-    steps.append({"input_ids": torch.tensor([99]), "positions": torch.tensor([2]), "site": torch.tensor([[99.]])})
-    result = assemble_rows(steps, tokens, ["site"])["site"]
-    assert result.flatten().tolist() == [10., 20., 30., 40., 11., 21.]
-    with pytest.raises(RuntimeError, match="Missing"):
-        assemble_rows(steps[:1], tokens, ["site"])
 
 
 @pytest.mark.parametrize("site", [(-1, "resid_post"), (True, "resid_post"), (0, "expert")])

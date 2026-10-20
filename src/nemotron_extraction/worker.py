@@ -1,31 +1,11 @@
 """Nemotron hooks inside a vLLM worker; RPCs never wait for shard writes."""
 from __future__ import annotations
-from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 import time
 import torch
 from .hooks import install
 from .transport import BufferPool, capture_seconds, finish_copy, memory_peaks, publish, seconds, timeline
 from .types import HookSite, validate_publication_threads
-
-
-def assemble_rows(steps, token_ids, keys):
-    """Legacy whole-prefill matching, retained for older captures."""
-    pending = defaultdict(deque)
-    for index, row in enumerate(token_ids.tolist()):
-        pending[tuple(row)].append(index)
-    found = {}
-    for step in steps:
-        ids, positions = step["input_ids"].cpu(), step["positions"].cpu()
-        starts = (positions == 0).nonzero().flatten().tolist() + [positions.numel()]
-        for start, end in zip(starts, starts[1:]):
-            matches = pending.get(tuple(ids[start:end].tolist()))
-            if matches:
-                found[matches.popleft()] = (step, start, end)
-    if len(found) != token_ids.shape[0]:
-        raise RuntimeError(f"Missing prompt activations: {sorted(set(range(len(token_ids))) - found.keys())}")
-    return {key: torch.cat([found[i][0][key][found[i][1]:found[i][2]]
-                           for i in range(len(token_ids))]) for key in keys}
 
 
 def external_request_id(rid, known):
