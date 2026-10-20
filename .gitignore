@@ -20,3 +20,5 @@ internal_docs/
 *.fdb_latexmk
 *.synctex.gz
 *.xdv
+*.safetensors
+*.tar.gz

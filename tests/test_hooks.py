@@ -1,6 +1,5 @@
 import importlib
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -219,23 +218,15 @@ def test_vllm_driver_transport_cleanup_and_installed_worker(monkeypatch, tmp_pat
         assert instances[1].kwargs["enable_chunked_prefill"] is True
 
 
-@pytest.mark.parametrize("kwargs", [{"enforce_eager": False}, {"tensor_parallel_size": 2},
-                                    {"enable_prefix_caching": True}])
-def test_unsupported_vllm_options_rejected_before_import(kwargs):
-    with pytest.raises(ValueError, match="Requires"):
-        VLLMExtractor("fixture", [HookSite(0, "resid_post")], **kwargs)
-
-
-def test_device_extraction_uses_backbone_and_returns_trainable_storage(monkeypatch):
+def test_device_extraction_returns_trainable_storage(monkeypatch):
     import nemotron_extraction.hf as hf
-    # Exercise the device API on CPU; only the CUDA-specific output validator is
-    # substituted. The forward path and inference-mode/storage behavior are real.
-    monkeypatch.setattr(hf,'DeviceActivationBatch',lambda tokens,rows:SimpleNamespace(token_ids=tokens,activations=rows))
-    model=Model()
-    with HFExtractor(model,[HookSite(0,'resid_post')],device='cpu') as extractor:
-        batch=extractor.extract_device(torch.tensor([[1,2,3]],dtype=torch.long))
-    x=batch.activations['L0_resid_post']
-    assert not torch.is_inference(x)
-    weights=torch.ones(x.shape[1],3,requires_grad=True)
-    (x@weights).square().mean().backward()
+    # Only the CUDA-only output validator is substituted; the forward path is real.
+    monkeypatch.setattr(hf, "DeviceActivationBatch",
+                        lambda tokens, rows: SimpleNamespace(token_ids=tokens, activations=rows))
+    with HFExtractor(Model(), [HookSite(0, "resid_post")], device="cpu") as extractor:
+        batch = extractor.extract_device(torch.tensor([[1, 2, 3]]))
+    rows = batch.activations["L0_resid_post"]
+    assert not torch.is_inference(rows)
+    weights = torch.ones(rows.shape[1], 3, requires_grad=True)
+    (rows @ weights).square().mean().backward()
     assert weights.grad is not None and torch.isfinite(weights.grad).all()

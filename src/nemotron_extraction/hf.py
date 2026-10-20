@@ -30,8 +30,8 @@ class Capture(NamedTuple):
 class HFExtractor:
     """Eager PyTorch reference; accepts a model ID or a caller-owned nn.Module."""
     def __init__(self, model, sites, *, revision=None, device="cuda", dtype=torch.bfloat16,
-                 trust_remote_code=True, local_files_only=False, gpu_memory_utilization=0.96,
-                 diagnostics=False, publication_threads=1):
+                 trust_remote_code=True, local_files_only=False, diagnostics=False,
+                 publication_threads=1):
         self.diagnostics = diagnostics
         self.publication_threads = validate_publication_threads(publication_threads)
         self.sites = validate_sites(sites)
@@ -51,7 +51,6 @@ class HFExtractor:
         self.capture_events = []
         self.model_forward_seconds = 0.0
         self.cpu_copy_seconds = 0.0
-        self.gpu_memory_utilization = gpu_memory_utilization
         self.pool = BufferPool()
         self.producer = ThreadPoolExecutor(max_workers=1)
         self.writer = ThreadPoolExecutor(max_workers=publication_threads)

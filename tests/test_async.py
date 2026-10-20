@@ -1,7 +1,6 @@
 import asyncio
 import contextlib
 import threading
-from pathlib import Path
 import pytest
 import torch
 from safetensors.torch import load_file

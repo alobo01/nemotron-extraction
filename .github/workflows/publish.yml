@@ -17,7 +17,7 @@ jobs:
   build:
     name: Build distributions
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -25,6 +25,8 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           python-version: "3.12"
+      - name: Run tests
+        run: uv run --locked --group dev pytest -q
       - name: Verify release version
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -94,11 +96,9 @@ jobs:
           Activation hooks for the official Nemotron 3 Nano BF16 checkpoint.
 
           - Hugging Face Transformers and asynchronous vLLM extraction with six hook types.
-          - Single-file benchmark for English, German and Spanish.
-          - Validation report, contribution instructions and BibTeX citation.
+          - Cross-backend validation benchmark for English, German and Spanish.
 
-          All 40 local tests pass. Cross-backend agreement passed at 3 of 18 sites
-          per language in the documented sample; see the report for measurements.
+          See the README and docs/report.pdf for measurements.
           EOF
           gh release create "$RELEASE_TAG" dist/* --verify-tag \
             --title "Nemotron Extraction $RELEASE_TAG" --notes-file release-notes.md

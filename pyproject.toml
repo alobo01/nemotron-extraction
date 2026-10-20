@@ -28,4 +28,3 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["cuda: requires a real CUDA model and inference engines"]

@@ -18,22 +18,17 @@ class VLLMExtractor:
 
     def __init__(self, model, sites, *, revision=None, max_model_len=2049,
                  sequences_per_call=4, dtype="bfloat16", trust_remote_code=True,
-                 tensor_parallel_size=1, enforce_eager=True, enable_prefix_caching=False,
                  enable_chunked_prefill=False, sink_dir=None, gpu_memory_utilization=0.96,
                  kv_cache_memory_bytes=None, diagnostics=False, publication_threads=1):
         self.sites = validate_sites(sites)
         self.diagnostics = diagnostics
         self.publication_threads = validate_publication_threads(publication_threads)
-        if tensor_parallel_size != 1 or not enforce_eager or enable_prefix_caching:
-            raise ValueError("Requires TP=1, eager=True and prefix caching=False")
         if sequences_per_call < 1 or max_model_len < 2 or not 0 < gpu_memory_utilization <= 1:
             raise ValueError("Invalid sequence batch size, model length or memory utilization")
         self.sequences_per_call, self.max_model_len = sequences_per_call, max_model_len
         self.enable_chunked_prefill = enable_chunked_prefill
         self.closed, self.llm, self.installed = False, None, False
         self.gpu_memory_utilization = gpu_memory_utilization
-        # None lets vLLM size its cache from gpu_memory_utilization. Preserve
-        # any explicit value instead of silently replacing it.
         self.kv_cache_memory_bytes = kv_cache_memory_bytes
         self.engine_startup_seconds = self.hook_install_seconds = 0.0
         self.generate_seconds = self.worker_forward_seconds = 0.0

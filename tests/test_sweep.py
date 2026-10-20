@@ -2,7 +2,6 @@ import argparse
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
-import json
 from pathlib import Path
 import torch
 from safetensors.torch import save_file
