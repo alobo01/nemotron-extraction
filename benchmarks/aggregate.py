@@ -8,7 +8,6 @@ import importlib.util
 import json
 from pathlib import Path
 
-import torch
 from safetensors.torch import load_file
 
 spec = importlib.util.spec_from_file_location("validate", Path(__file__).with_name("validate.py"))

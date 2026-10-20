@@ -17,7 +17,6 @@ import hashlib
 import importlib.metadata
 import json
 import math
-import os
 from pathlib import Path
 import sys
 import time
@@ -26,9 +25,9 @@ import traceback
 import torch
 from safetensors.torch import load_file, save_file
 from nemotron_extraction import HFExtractor, VLLMExtractor
-from nemotron_extraction.diagnostics import (TokenDiagnostics, TraceHooks, digest, layers_of,
+from nemotron_extraction.diagnostics import (TokenDiagnostics, TraceHooks, digest,
     runtime_config, write_json)
-from nemotron_extraction.hooks import repair_time_step_limits, representative_sites
+from nemotron_extraction.hooks import repair_time_step_limits
 from targeted_validation import Utilisation
 
 MODEL='nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16'

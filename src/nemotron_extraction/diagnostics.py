@@ -24,7 +24,6 @@ from .hooks import argument, install, layers_of, mixer_kind, projection_of, tens
 from .moe_diagnostics import (decompose_four_outputs, manual_nemotron_moe,
     manual_sigmoid_router, routing_report)
 from .precision import tensor_digest
-from .types import HookSite
 from .worker import ActivationHookExtension, external_request_id
 
 # Anchor rows whose routed experts are fingerprinted in the MoE replay report.
