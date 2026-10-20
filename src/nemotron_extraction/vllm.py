@@ -226,15 +226,16 @@ class VLLMExtractor:
             self.driver_read_seconds += time.perf_counter() - started
             return ActivationBatch(tokens, {key: torch.cat(values) for key, values in parts.items()})
 
-    def extract(self, token_ids):
+    def _submit_extract(self, token_ids):
         if self.closed:
             raise RuntimeError("Extractor is closed")
-        return self._future(self._extract(token_ids)).result()
+        return self._future(self._extract(token_ids))
+
+    def extract(self, token_ids):
+        return self._submit_extract(token_ids).result()
 
     async def extract_async(self, token_ids):
-        if self.closed:
-            raise RuntimeError("Extractor is closed")
-        return await asyncio.wrap_future(self._future(self._extract(token_ids)))
+        return await asyncio.wrap_future(self._submit_extract(token_ids))
 
     async def _close(self):
         for task in list(self.tasks):
