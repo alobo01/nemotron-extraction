@@ -24,7 +24,7 @@ from .hooks import argument, install, layers_of, mixer_kind, projection_of
 from .moe_diagnostics import (decompose_four_outputs, manual_nemotron_moe,
     manual_sigmoid_router, routing_report)
 from .types import HookSite
-from .worker import ActivationHookExtension
+from .worker import ActivationHookExtension, external_request_id
 
 
 def digest(path):
@@ -433,12 +433,7 @@ class DiagnosticWorker:
         starts = self.model_runner.query_start_loc.cpu[:len(ids)+1].tolist()
         self.diag_trace.span = None
         for i,internal in enumerate(ids):
-            rid = internal
-            if rid not in case['requests']:
-                external,sep,suffix = rid.rpartition('-')
-                if not sep or len(suffix)!=8 or external not in case['requests']:
-                    raise RuntimeError('Unknown request ID '+rid)
-                rid=external
+            rid = external_request_id(internal, case['requests'])
             expected = case['requests'][rid]
             computed = int(batch.num_computed_tokens_cpu[i])
             start,stop = int(starts[i]),int(starts[i+1])

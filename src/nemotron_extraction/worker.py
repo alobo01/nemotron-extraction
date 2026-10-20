@@ -28,6 +28,17 @@ def assemble_rows(steps, token_ids, keys):
                            for i in range(len(token_ids))]) for key in keys}
 
 
+def external_request_id(rid, known):
+    """Map a scheduler request ID back to the caller's ID."""
+    if rid in known:
+        return rid
+    # vLLM 0.20.1 appends an eight-character internal uniqueness suffix.
+    external, separator, suffix = rid.rpartition("-")
+    if not separator or len(suffix) != 8 or external not in known:
+        raise RuntimeError(f"Unknown request ID {rid}")
+    return external
+
+
 class ActivationHookExtension:
     def nh_install(self, sites, sink_dir, diagnostics=False, publication_threads=1):
         validate_publication_threads(publication_threads)
@@ -93,12 +104,7 @@ class ActivationHookExtension:
         length = wave["tokens"].shape[1]
         for index, rid in enumerate(ids):
             computed = int(batch.num_computed_tokens_cpu[index])
-            if rid not in wave["requests"]:
-                # vLLM 0.20.1 appends an eight-character internal uniqueness suffix.
-                external, separator, suffix = rid.rpartition("-")
-                if not separator or len(suffix) != 8 or external not in wave["requests"]:
-                    raise RuntimeError(f"Unknown request ID {rid}")
-                rid = external
+            rid = external_request_id(rid, wave["requests"])
             prompt_index = wave["requests"][rid]
             start, end = int(starts[index]), int(starts[index + 1])
             if computed >= length:
