@@ -1,19 +1,15 @@
 # Nemotron extraction 1.0
 
-Activations describe a model's internal state as it processes tokens.
-This package captures them from the official
+This package captures activations, a model's internal state as it processes tokens, from the official
 [`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
-checkpoint through two backends: Hugging Face Transformers, running with PyTorch,
-and vLLM, an inference engine.
+checkpoint using Hugging Face Transformers with PyTorch or the vLLM inference engine.
 
-A hook captures activations at a chosen location (site).
-In vLLM, hooks run inside worker processes on the graphics processor (GPU).
-The driver installs hooks through `collective_rpc` and submits token IDs.
-Workers copy captures into pinned host buffers on a separate CUDA stream and
-save Safetensors files, allowing transfers and writes to overlap inference.
-Request IDs preserve sequence order, including repeats.
-
-Hooks reconstruct residuals and clone tensors before later operations overwrite them.
+A hook records activations at a chosen location, called a site.
+In vLLM, hooks run inside graphics processor (GPU) worker processes.
+The driver installs them through `collective_rpc` and submits token IDs.
+Workers reconstruct residuals, preserve tensors before mutation, then copy them
+to pinned host buffers and save Safetensors files. Transfers and writes can
+overlap inference. Request IDs preserve sequence order, including repeats.
 
 ## Install and use
 
@@ -31,6 +27,7 @@ from nemotron_extraction import HookSite, VLLMExtractor
 sites = [HookSite(12, "resid_post"), HookSite(12, "attn_out_prelinear")]
 with VLLMExtractor(
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", sites,
+    enable_chunked_prefill=True,
 ) as extractor:
     batch = extractor.extract(torch.tensor([[1, 2, 3]], dtype=torch.long))
     print(batch.activations["L12_resid_post"].shape)  # (3, hidden_width)
@@ -41,36 +38,34 @@ Both support `await extract_async(token_ids)` and
 At most two batches await saving. Layers are zero-based. Sites:
 `resid_pre`, `resid_post`, `mamba_out`, `moe_out`, `attn_out`,
 `attn_out_prelinear`; mixer-specific sites require a compatible layer.
-Inputs are rectangular int64 batches without padding; outputs in host memory have shape
+Inputs are rectangular int64 batches without padding. CPU outputs have shape
 `(batch × sequence_length, site_width)` in sequence-major order.
-Use separate calls for different lengths.
 
-Extraction requires eager execution, tensor parallelism of one, and disabled
-prefix caching. Chunked prefill is off by default; enable it for models that
-require it. The full prompt batch must fit in one prefill pass; partial-prefill
-captures are rejected. Only prompt activations are captured.
+Detailed token checks and capture profiling are opt-in (`diagnostics=True`).
+Request attribution, coverage and finite-output checks remain enabled.
+`publication_threads=1` or `2` controls saving; the default is one.
+
+Extraction requires eager execution, tensor parallelism one and disabled prefix
+caching. Enable chunked prefill for this checkpoint; scheduler checks reject
+partial prompts. Generated tokens are excluded.
 
 ## Validation
 
-One script freezes inputs, compares both backends sequentially for English,
-German and Spanish, and saves JSON results and Markdown reports.
-uv installs the package and dependencies automatically:
+The benchmark freezes inputs and compares both backends sequentially:
 
 ```bash
 uv run benchmarks/validate.py all
 ```
 
-Hugging Face Transformers and vLLM produce close activations, but only 3/18 sites
-passed all agreement checks per language. Interchangeability for sparse autoencoder training
-remains unvalidated.
+The activations are close, but only 3/18 sites passed all agreement checks per
+language. Their interchangeability remains unvalidated.
 
-The table summarises a batch-8 validation sample with 16,384 tokens/language from
+The batch-8 sample contains 16,384 tokens/language from
 FineWeb-Edu (English) and FineWeb2 (German/Spanish). Cosine measures direction
-(1 means aligned). Normalised mean squared error (MSE) divides squared error by
-the reference's squared norm. Both backends share the Hugging Face Transformers
-reference root mean square as their scale.
-It retains magnitude differences; 0 means identical. Values are mean +/- population standard deviation (SD)
-across 18 equally weighted sites.
+(1 means aligned). Normalised mean squared error (MSE) divides total squared
+disagreement by total reference squared magnitude, retaining scale differences.
+Zero means identical. Values are mean +/- population standard deviation (SD)
+across 18 sites.
 
 | Language | Mean cosine +/- SD | Normalised MSE +/- SD |
 |---|---:|---:|
@@ -78,12 +73,15 @@ across 18 equally weighted sites.
 | German | 0.998623 +/- 0.001719 | 0.002650 +/- 0.003230 |
 | Spanish | 0.998701 +/- 0.001619 | 0.002435 +/- 0.002989 |
 
-The discrepancy remains unresolved. The default benchmark uses exactly
-1,000,000 tokens per language.
+The discrepancy remains unresolved. The default benchmark uses 1,000,000 tokens/language.
 See the [report](report.pdf) and [source](report.tex).
 
 Runs used Python 3.12, Hugging Face Transformers 4.57.6/PyTorch 2.8.0a0, and
 vLLM 0.27.1/PyTorch 2.14.0a0.
+
+For targeted investigations, `benchmarks/diagnose_divergence.py` traces operations;
+`benchmarks/extraction_speed.py` measures direct saving at batches 8/64 with three
+repetitions. Install the selected wheel with `uv` before comparing source changes.
 
 ## Contributing
 
@@ -93,14 +91,4 @@ Compile the report with `pdflatex report.tex`.
 
 ## Citation
 
-Antonio Lobo-Santos, DFKI. Download [BibTeX](CITATION.bib):
-
-```bibtex
-@misc{lobo_santos2026nemotron_extraction,
-  author = {Lobo-Santos, Antonio},
-  title = {{Nemotron Extraction}},
-  year = {2026},
-  howpublished = {Software, version 1.0.0},
-  note = {DFKI}
-}
-```
+Antonio Lobo-Santos, affiliated with DFKI. [BibTeX](CITATION.bib).

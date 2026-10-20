@@ -6,6 +6,9 @@ __pycache__/
 build/
 dist/
 /outputs/
+/output/
+/tmp/
+/.claude/worktrees/
 .env
 .env.*
 internal_docs/

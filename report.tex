@@ -5,12 +5,12 @@
 \usepackage{hyperref}
 \hypersetup{colorlinks=true,urlcolor=blue,linkcolor=blue,pdftitle={Nemotron activation extraction: validation note},pdfauthor={Antonio Lobo-Santos, DFKI}}
 \setlength{\parindent}{0pt}
-\setlength{\parskip}{5pt}
+\setlength{\parskip}{4pt}
 \begin{document}
 \begin{center}
 {\Large\bfseries Nemotron activation extraction}\par\vspace{3pt}
 {\small Antonio Lobo-Santos, DFKI}\par
-{\small Version 1.0.0, 15 October 2026}
+{\small Version 1.0.0, 19 October 2026}
 \end{center}
 
 Activations describe a model's internal state as it processes tokens.
@@ -19,13 +19,15 @@ A hook records these activations at a chosen location, called a site.
 \href{https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}{Nemotron 3 Nano BF16 checkpoint}.
 We compare two backends: Hugging Face Transformers, which runs the model with
 PyTorch, and vLLM, an inference engine that manages model execution.
-The comparison tests whether their activations can be used interchangeably for
-sparse autoencoder training.
+The comparison tests whether their activations meet fixed numerical agreement criteria.
 
 vLLM runs the model in worker processes on the graphics processor (GPU).
 The driver installs hooks there through \texttt{collective\_rpc}; workers
 preserve prompt order and save captures through pinned host buffers.
 A two-batch queue allows transfers and writes to overlap inference.
+Detailed token checking and capture profiling are optional. Request attribution,
+prompt coverage and finite-value checks remain enabled. One or two publication
+threads share the same two-buffer bound; the default remains one thread.
 
 The backends produce similar activations, but only 3/18 sites per language meet
 all agreement thresholds. Interchangeability therefore remains unvalidated.
@@ -64,23 +66,29 @@ Normalised MSE was recomputed from saved sums without rerunning inference.
 The table describes this validation sample, while the benchmark defaults to
 one million tokens per language. The cause of the discrepancy remains unresolved.
 
-To narrow the cause, we compared the package hooks with the original extraction
-hooks on host-processor test models. All six hook types returned bitwise-identical 32-bit floating-point
-and BF16 tensors. Higher-precision calculations changed mean cosine by less than
-$6.6\times10^{-7}$ on retained samples. GPU correctness remains unverified;
-different computational kernels and mixture-of-experts routing are possible
-contributors, not confirmed explanations.
+For a 2,048-token English diagnostic anchor, each backend's saved trace exactly
+matched its captured values. The vLLM scheduler confirmed a whole prompt with
+zero previously computed tokens. This establishes trace persistence and prompt
+coverage. Differences in computational kernels and mixture-of-experts routing
+remain possible explanations for the numerical discrepancy, without a confirmed cause.
 
 Both backends ran eagerly in BF16 on an H100 80GB. Hugging Face Transformers used PyTorch 2.8.0a0,
 CUDA 12.9, Transformers 4.57.6, Mamba-SSM 2.3.2.post1 and causal-conv1d 1.7.0;
 vLLM used version 0.27.1, PyTorch 2.14.0a0, CUDA 13.4 and Transformers 5.14.1.
 Thus, identical weights and inputs did not imply identical numerical kernels.
+A controlled attempt to run Transformers in the vLLM environment failed because
+\texttt{mamba-ssm} could not be imported. The software-stack difference therefore
+remains unresolved.
+
+The diagnostic script traces a 128-token anchor and its full 2,048-token sequence.
+The speed script uses 64 frozen English sequences, batches of 8 and 64, and
+three repetitions. It separates startup, extraction and comparison, measuring
+prompt activations saved to disk after warmup. These scripts define the
+investigation; no new speedup is claimed here.
 
 \textbf{Reproduction.}
-Build and install with \texttt{uv build} and \texttt{uv pip install}; follow the
-README's single benchmark command to prepare frozen inputs and compare both
-backends across English, German and Spanish. The script saves JSON results and
-Markdown reports. Compile this report with \texttt{pdflatex report.tex}.
-Contribution instructions and BibTeX metadata for Antonio Lobo-Santos, DFKI,
-are provided in the README and \texttt{CITATION.bib}.
+Build with \texttt{uv build}, install the wheel with \texttt{uv pip install},
+then follow the README's benchmark commands. Scripts save JSON receipts and
+Markdown reports. Compile \texttt{report.tex} with \texttt{pdflatex}. Citation metadata
+is in \texttt{CITATION.bib}.
 \end{document}
