@@ -145,6 +145,15 @@ class VLLMExtractor:
                     await emit(completed.pop(next_yield))
                     next_yield += 1
 
+            async def drain(limit):
+                """Poll until at most `limit` publications are pending; return seconds waited."""
+                started = time.perf_counter()
+                while len(pending) > limit:
+                    await collect()
+                    if len(pending) > limit:
+                        await asyncio.sleep(.02)
+                return time.perf_counter() - started
+
             index = 0
             for batch in token_batches:
                 tokens = validate_tokens(batch)
@@ -152,12 +161,7 @@ class VLLMExtractor:
                     raise ValueError("Prompt plus one generated token exceeds max_model_len")
                 for chunk in tokens.split(self.sequences_per_call):
                     if len(pending) >= 2:
-                        started = time.perf_counter()
-                        while len(pending) >= 2:
-                            await collect()
-                            if len(pending) >= 2:
-                                await asyncio.sleep(.02)
-                        self.backpressure_seconds += time.perf_counter() - started
+                        self.backpressure_seconds += await drain(1)
                     path = Path(output_dir) / f"{index:06d}.safetensors"
                     if path.exists():
                         raise FileExistsError(path)
@@ -177,12 +181,7 @@ class VLLMExtractor:
                     await self.llm.collective_rpc("nh_seal", args=(wave_id,))
                     self.worker_rpc_seconds += time.perf_counter() - rpc_started
                     index += 1
-            started = time.perf_counter()
-            while pending:
-                await collect()
-                if pending:
-                    await asyncio.sleep(.02)
-            self.final_drain_seconds += time.perf_counter() - started
+            self.final_drain_seconds += await drain(0)
 
     async def stream_to_disk(self, token_batches, output_dir):
         """Yield ordered durable shard receipts; two publications may overlap inference."""
