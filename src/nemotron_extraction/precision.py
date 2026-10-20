@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import ast
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import hashlib
 import json
 from pathlib import Path
@@ -114,39 +114,43 @@ class PrecisionWorker:
         verified = []
         prefix = 'backbone.layers.1.mixer.'
 
-        def read(name):
-            key = prefix + name
-            with safe_open(str(model_path / index[key]), framework='pt') as file:
-                return file.get_tensor(key)
+        files = {}
+        with ExitStack() as stack:
+            def read(name):
+                key = prefix + name
+                shard = index[key]
+                if shard not in files:
+                    files[shard] = stack.enter_context(safe_open(str(model_path / shard), framework='pt'))
+                return files[shard].get_tensor(key)
 
-        def assign(module, name, value, checkpoint_name, allow_router_cast=False):
-            original = read(checkpoint_name)
-            loaded = value.detach().cpu()
-            if (not allow_router_cast and original.dtype != value.dtype) or not torch.equal(original.to(value.dtype), loaded):
-                raise ValueError(f'Loaded parameter differs from checkpoint: {checkpoint_name}')
-            verified.append(dict(name=checkpoint_name, checkpoint_dtype=str(original.dtype),
-                loaded_dtype=str(value.dtype), checkpoint_sha256=tensor_digest(original)))
-            if allow_router_cast:
-                delta = original.float() - loaded.float()
-                verified[-1].update(loaded_cast_changes_values=bool(delta.any()),
-                                    maximum_cast_absolute_error=float(delta.abs().max()))
-            # The reference router keeps original checkpoint values in float32.
-            tensor = original.to(device=value.device, dtype=torch.float32) if allow_router_cast else value.detach()
-            setattr(module, name, nn.Parameter(tensor, requires_grad=False))
+            def assign(module, name, value, checkpoint_name, allow_router_cast=False):
+                original = read(checkpoint_name)
+                loaded = value.detach().cpu()
+                if (not allow_router_cast and original.dtype != value.dtype) or not torch.equal(original.to(value.dtype), loaded):
+                    raise ValueError(f'Loaded parameter differs from checkpoint: {checkpoint_name}')
+                verified.append(dict(name=checkpoint_name, checkpoint_dtype=str(original.dtype),
+                    loaded_dtype=str(value.dtype), checkpoint_sha256=tensor_digest(original)))
+                if allow_router_cast:
+                    delta = original.float() - loaded.float()
+                    verified[-1].update(loaded_cast_changes_values=bool(delta.any()),
+                                        maximum_cast_absolute_error=float(delta.abs().max()))
+                # The reference router keeps original checkpoint values in float32.
+                tensor = original.to(device=value.device, dtype=torch.float32) if allow_router_cast else value.detach()
+                setattr(module, name, nn.Parameter(tensor, requires_grad=False))
 
-        for expert in range(config['n_routed_experts']):
-            assign(reference.experts[expert].up_proj, 'weight', up[expert], f'experts.{expert}.up_proj.weight')
-            assign(reference.experts[expert].down_proj, 'weight', down[expert], f'experts.{expert}.down_proj.weight')
-        for projection in ('up_proj', 'down_proj'):
-            assign(getattr(reference.shared_experts, projection), 'weight',
-                getattr(mixer.shared_experts, projection).weight, f'shared_experts.{projection}.weight')
-        assign(reference.gate, 'weight', mixer.gate.weight, 'gate.weight', allow_router_cast=True)
-        original_bias = read('gate.e_score_correction_bias')
-        if not torch.equal(original_bias, mixer.gate.e_score_correction_bias.detach().cpu()):
-            raise ValueError('Router correction bias differs from checkpoint')
-        reference.gate.e_score_correction_bias = original_bias.to(up.device)
-        verified.append(dict(name='gate.e_score_correction_bias', checkpoint_dtype=str(original_bias.dtype),
-                             checkpoint_sha256=tensor_digest(original_bias)))
+            for expert in range(config['n_routed_experts']):
+                assign(reference.experts[expert].up_proj, 'weight', up[expert], f'experts.{expert}.up_proj.weight')
+                assign(reference.experts[expert].down_proj, 'weight', down[expert], f'experts.{expert}.down_proj.weight')
+            for projection in ('up_proj', 'down_proj'):
+                assign(getattr(reference.shared_experts, projection), 'weight',
+                    getattr(mixer.shared_experts, projection).weight, f'shared_experts.{projection}.weight')
+            assign(reference.gate, 'weight', mixer.gate.weight, 'gate.weight', allow_router_cast=True)
+            original_bias = read('gate.e_score_correction_bias')
+            if not torch.equal(original_bias, mixer.gate.e_score_correction_bias.detach().cpu()):
+                raise ValueError('Router correction bias differs from checkpoint')
+            reference.gate.e_score_correction_bias = original_bias.to(up.device)
+            verified.append(dict(name='gate.e_score_correction_bias', checkpoint_dtype=str(original_bias.dtype),
+                                 checkpoint_sha256=tensor_digest(original_bias)))
         reference.eval()
         self.precision_config = self.model_runner.vllm_config
         self.precision_original_gate = mixer.gate.forward
