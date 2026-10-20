@@ -20,11 +20,15 @@ import torch
 from torch import nn
 from safetensors.torch import load_file, save_file
 
-from .hooks import argument, install, layers_of, mixer_kind, projection_of
+from .hooks import argument, install, layers_of, mixer_kind, projection_of, tensor_output
 from .moe_diagnostics import (decompose_four_outputs, manual_nemotron_moe,
     manual_sigmoid_router, routing_report)
+from .precision import tensor_digest
 from .types import HookSite
 from .worker import ActivationHookExtension, external_request_id
+
+# Anchor rows whose routed experts are fingerprinted in the MoE replay report.
+ANCHOR_POSITIONS = (571, 1467, 2005, 2021)
 
 
 def digest(path):
@@ -34,6 +38,11 @@ def digest(path):
         for chunk in iter(lambda: handle.read(1 << 20), b''):
             result.update(chunk)
     return result.hexdigest()
+
+
+def same_expert_sets(left, right):
+    """Per-row equality of selected expert IDs, ignoring top-k order."""
+    return (torch.sort(left.long(), dim=-1).values == torch.sort(right.long(), dim=-1).values).all(dim=-1)
 
 
 def write_json(path, value):
@@ -184,10 +193,6 @@ def sibling_namespace(directory):
                   ('MIXER_KINDS','RESIDUAL_KINDS') for t in n.targets)]
         exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(path), 'exec'), scope)
     return scope
-
-
-def tensor_output(value):
-    return value[0] if isinstance(value, tuple) else value
 
 
 def runtime_config(model, runner=None):
@@ -342,7 +347,7 @@ class TraceHooks:
         self.detail_observability=dict(mixer_type=type(mixer).__name__,requested=list(wanted),observed=[],
             routing_ids='unobserved',state_policy='new request, position zero; no reused request cache')
         self.detail_observability['parameters']={name:dict(shape=list(p.shape),dtype=str(p.dtype),
-            sha256=hashlib.sha256(p.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest())
+            sha256=tensor_digest(p))
             for name,p in mixer.named_parameters()}
         def capture(name,module,args,output):
             values=output if isinstance(output,tuple) else (output,)
@@ -717,15 +722,11 @@ class DiagnosticWorker:
             'tf32_matmul':str(torch.backends.cuda.matmul.allow_tf32),
         })
         partial.replace(path)
-        same_rows=(torch.sort(routes_h['ids'].long(),dim=-1).values
-                   ==torch.sort(routes_v['ids'].long(),dim=-1).values).all(dim=-1)
-        tf32_same=(torch.sort(tf32_results['False']['ids'].long(),dim=-1).values
-                   ==torch.sort(tf32_results['True']['ids'].long(),dim=-1).values).all(dim=-1)
+        same_rows=same_expert_sets(routes_h['ids'],routes_v['ids'])
+        tf32_same=same_expert_sets(tf32_results['False']['ids'],tf32_results['True']['ids'])
         logits_delta=(tf32_results['False']['logits'].float()-tf32_results['True']['logits'].float()).abs()
-        router_match_h=(torch.sort(routes_h['ids'].long(),dim=-1).values
-                        ==torch.sort(manual_router_h['ids'].long(),dim=-1).values).all(dim=-1)
-        router_match_v=(torch.sort(routes_v['ids'].long(),dim=-1).values
-                        ==torch.sort(manual_router_v['ids'].long(),dim=-1).values).all(dim=-1)
+        router_match_h=same_expert_sets(routes_h['ids'],manual_router_h['ids'])
+        router_match_v=same_expert_sets(routes_v['ids'],manual_router_v['ids'])
         def aligned_weight_delta(native_routes,manual_routes):
             native_order=native_routes['ids'].long().argsort(dim=-1)
             manual_order=manual_routes['ids'].long().argsort(dim=-1)
@@ -739,24 +740,22 @@ class DiagnosticWorker:
                        aligned_weight_delta(routes_v,manual_router_v)]
         weight_deltas=[d for d in weight_deltas if d.numel()]
         selected_for_fingerprint=set()
-        for position in (571,1467,2005,2021):
+        for position in ANCHOR_POSITIONS:
             if position<len(xh):
                 selected_for_fingerprint.update(routes_h['ids'][position].long().tolist())
                 selected_for_fingerprint.update(routes_v['ids'][position].long().tolist())
                 selected_for_fingerprint.update(manual_router_h['ids'][position].long().tolist())
-        def tensor_sha(tensor):
-            return hashlib.sha256(tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
         router_fingerprints={
-            'gate_weight_sha256':tensor_sha(gate_weight),
-            'correction_bias_sha256':tensor_sha(correction),
+            'gate_weight_sha256':tensor_digest(gate_weight),
+            'correction_bias_sha256':tensor_digest(correction),
             'correction_bias_values':correction.detach().float().cpu().tolist(),
             'experts':{
-                str(expert):{'up_sha256':tensor_sha(w13[expert]),'down_sha256':tensor_sha(w2[expert]),
+                str(expert):{'up_sha256':tensor_digest(w13[expert]),'down_sha256':tensor_digest(w2[expert]),
                     'up_dtype':str(w13.dtype),'down_dtype':str(w2.dtype),
                     'up_shape':list(w13[expert].shape),'down_shape':list(w2[expert].shape)}
                 for expert in sorted(selected_for_fingerprint)
             },
-            'expert_ids_fingerprinted_at_anchor_positions':[571,1467,2005,2021],
+            'expert_ids_fingerprinted_at_anchor_positions':list(ANCHOR_POSITIONS),
         }
         return {
             'status':'complete','layer':layer_index,'tokens':int(xh.shape[0]),'hidden_width':int(xh.shape[1]),
@@ -792,7 +791,7 @@ class DiagnosticWorker:
                     str(position):{
                         'transformers_input':float(tensors['vllm_kth_to_best_excluded_margin_transformers_input'][position]),
                         'vllm_input':float(tensors['vllm_kth_to_best_excluded_margin_vllm_input'][position]),
-                    } for position in (571,1467,2005,2021) if position<len(xh)
+                    } for position in ANCHOR_POSITIONS if position<len(xh)
                 },
             },
             'tf32_router_control':{
