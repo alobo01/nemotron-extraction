@@ -98,8 +98,9 @@ def publish(tensors, path, metadata=None):
     except BaseException:
         partial.unlink(missing_ok=True)
         raise
+    finished = time.perf_counter()
     return {"path": str(path), "bytes": path.stat().st_size,
             "validation_seconds": validated - started,
             "serialization_seconds": serialized - validated,
-            "publication_seconds": time.perf_counter() - serialized,
-            "write_seconds": time.perf_counter() - started}
+            "publication_seconds": finished - serialized,
+            "write_seconds": finished - started}
