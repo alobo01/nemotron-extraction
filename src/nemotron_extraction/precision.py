@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
+import time
 from types import SimpleNamespace
 from typing import Optional
 
@@ -19,14 +20,18 @@ def tensor_digest(value):
     return hashlib.sha256(value.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
 
 
+def fp32_backends():
+    """Backends exposing ``fp32_precision``; resolved lazily because older torch lacks them."""
+    return (('global', torch.backends), ('matmul', torch.backends.cuda.matmul),
+            ('cudnn', torch.backends.cudnn), ('conv', torch.backends.cudnn.conv),
+            ('rnn', torch.backends.cudnn.rnn))
+
+
 def precision_settings():
     # Do not mix the legacy TF32 API with the API introduced after torch 2.9.
     modern = tuple(int(x) for x in str(torch.__version__).split('+')[0].split('.')[:2]) >= (2, 9)
     if modern:
-        settings = {name: getattr(owner, 'fp32_precision') for name, owner in (
-            ('global', torch.backends), ('matmul', torch.backends.cuda.matmul),
-            ('cudnn', torch.backends.cudnn), ('conv', torch.backends.cudnn.conv),
-            ('rnn', torch.backends.cudnn.rnn))}
+        settings = {name: owner.fp32_precision for name, owner in fp32_backends()}
     else:
         settings = dict(matmul_tf32=torch.backends.cuda.matmul.allow_tf32,
                         cudnn_tf32=torch.backends.cudnn.allow_tf32)
@@ -37,9 +42,7 @@ def precision_settings():
 
 def set_precision(settings):
     if settings['api'] == 'modern':
-        for name, owner in (('global', torch.backends), ('matmul', torch.backends.cuda.matmul),
-                            ('cudnn', torch.backends.cudnn), ('conv', torch.backends.cudnn.conv),
-                            ('rnn', torch.backends.cudnn.rnn)):
+        for name, owner in fp32_backends():
             owner.fp32_precision = settings[name]
     else:
         torch.backends.cuda.matmul.allow_tf32 = settings['matmul_tf32']
@@ -50,7 +53,7 @@ def set_precision(settings):
 def ieee_settings():
     settings = precision_settings()
     if settings['api'] == 'modern':
-        settings.update({k: 'ieee' for k in ('global', 'matmul', 'cudnn', 'conv', 'rnn')})
+        settings.update({name: 'ieee' for name, _ in fp32_backends()})
     else:
         settings.update(matmul_tf32=False, cudnn_tf32=False)
     settings['bf16_reduced_reduction'] = False
@@ -118,13 +121,14 @@ class PrecisionWorker:
 
         def assign(module, name, value, checkpoint_name, allow_router_cast=False):
             original = read(checkpoint_name)
-            if (not allow_router_cast and original.dtype != value.dtype) or not torch.equal(original.to(value.dtype), value.detach().cpu()):
+            loaded = value.detach().cpu()
+            if (not allow_router_cast and original.dtype != value.dtype) or not torch.equal(original.to(value.dtype), loaded):
                 raise ValueError(f'Loaded parameter differs from checkpoint: {checkpoint_name}')
             verified.append(dict(name=checkpoint_name, checkpoint_dtype=str(original.dtype),
                 loaded_dtype=str(value.dtype), checkpoint_sha256=tensor_digest(original)))
             if allow_router_cast:
-                delta = original.float() - value.detach().float().cpu()
-                verified[-1].update(loaded_cast_changes_values=not torch.equal(original.float(), value.detach().float().cpu()),
+                delta = original.float() - loaded.float()
+                verified[-1].update(loaded_cast_changes_values=bool(delta.any()),
                                     maximum_cast_absolute_error=float(delta.abs().max()))
             # The reference router keeps original checkpoint values in float32.
             tensor = original.to(device=value.device, dtype=torch.float32) if allow_router_cast else value.detach()
@@ -240,7 +244,6 @@ class PrecisionWorker:
                         mixer(x)
                     reference(x)
                     torch.cuda.synchronize()
-                    import time
                     started = time.perf_counter()
                     expected = reference(x)
                     torch.cuda.synchronize()
