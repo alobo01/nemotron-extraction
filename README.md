@@ -43,6 +43,8 @@ Inputs are nonempty, rectangular `int64` token ID tensors with shape `[batch, se
 
 Both extractors support `extract_async()` and `stream_to_disk()`. Disk streaming yields saved-shard receipts and keeps at most two batches in flight. `HFExtractor.extract_device()` returns CUDA activations for live training.
 
+For memory-bounded vLLM chunk sizes, set `sequences_per_call="auto"` and pass an `AutoBatchConfig` from `nemotron_extraction.batching`. Build its profile from a reference run; it accounts for model memory, per-sequence peak use, host capture and publication budgets.
+
 ## Measured performance and agreement
 
 In the recorded H200 run, the package's BF16 vLLM path saved activations at **5,535 input tokens/s** versus **3,930** for Transformers at batch size 64 (**1.41×**). A sibling fill-writer implementation reached **24,079 tokens/s** (**6.13×**). These figures cover 131,072 English tokens across 18 sites and describe package version 1.0.0; they are not a measurement of version 1.1.0. Each vLLM path passed the report's strict numerical agreement gates at only 3 of 18 sites. See the one-page [speed and agreement report](docs/report.pdf), its [source](docs/report.tex), and the [timing receipts](docs/extraction_speed_results.json) for scope and limitations.

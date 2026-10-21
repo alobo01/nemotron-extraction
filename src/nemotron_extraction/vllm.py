@@ -36,10 +36,19 @@ class VLLMExtractor(Extractor):
         kv_cache_memory_bytes=None,
         diagnostics=False,
         publication_threads=1,
+        auto_batch_config=None,
     ):
         super().__init__(sites, diagnostics, publication_threads)
-        if sequences_per_call < 1 or max_model_len < 2 or not 0 < gpu_memory_utilization <= 1:
+        automatic = sequences_per_call == "auto"
+        if (not automatic and sequences_per_call < 1) or max_model_len < 2 or not 0 < gpu_memory_utilization <= 1:
             raise ValueError("Invalid sequence batch size, model length or memory utilization")
+        self.auto_batch_config = auto_batch_config
+        if automatic:
+            if auto_batch_config is None:
+                raise ValueError('Automatic extraction batching needs an AutoBatchConfig memory profile')
+            free,total=torch.cuda.mem_get_info()
+            sequences_per_call=auto_batch_config.fit(total,gpu_memory_utilization,external_used_bytes=total-free)
+        self.sequence_ceiling = sequences_per_call
         self.sequences_per_call, self.max_model_len = sequences_per_call, max_model_len
         self.enable_chunked_prefill = enable_chunked_prefill
         self.llm, self.installed = None, False
@@ -114,6 +123,15 @@ class VLLMExtractor(Extractor):
             self.worker_forward_seconds += receipt["worker_forward_seconds"]
             self.actual_forward_batches.extend(receipt["actual_forward_batches"])
             self._fold_memory(receipt)
+            if self.auto_batch_config is not None:
+                total=receipt.get('total_device_memory_bytes',0)
+                peak=receipt.get('peak_device_memory_bytes',0)
+                if total and peak > self.gpu_memory_utilization*total:
+                    frame=self.auto_batch_config.frame_sequences
+                    next_size=max(frame,(self.sequences_per_call-frame)//frame*frame)
+                    if next_size==self.sequences_per_call:
+                        raise MemoryError('One extraction archive frame exceeds the device memory target')
+                    self.sequences_per_call=next_size
         return ready
 
     async def _generate(self, tokens, ids):
@@ -146,6 +164,7 @@ class VLLMExtractor(Extractor):
 
     async def _stream_inner(self, token_batches, output_dir, emit):
         async with self.lock:
+            call_sequences = self.sequences_per_call
             pending, completed = {}, {}
             next_yield = 0
             namespace = uuid.uuid4().hex
@@ -174,7 +193,7 @@ class VLLMExtractor(Extractor):
                 tokens = validate_tokens(batch)
                 if tokens.shape[1] + 1 > self.max_model_len:
                     raise ValueError("Prompt plus one generated token exceeds max_model_len")
-                for chunk in tokens.split(self.sequences_per_call):
+                for chunk in tokens.split(call_sequences):
                     if len(pending) >= SLOTS:
                         self.backpressure_seconds += await drain(SLOTS - 1)
                     path = self.shard_path(output_dir, index)
