@@ -3,6 +3,7 @@ import json
 from types import SimpleNamespace
 
 import diagnose_divergence as diagnostic
+import pytest
 import torch
 from benchlib.divergence import analyse, boundary_order, pair_metrics
 from safetensors.torch import load_file, save_file
@@ -58,7 +59,8 @@ def test_comparison_selects_first_failure_and_saves_worst_samples(tmp_path):
     assert result["gates_unchanged"]
 
 
-def test_original_transformers_persistence_matches_same_forward_oracle_and_reuses_buffers(tmp_path):
+@pytest.mark.parametrize("decoder_name", ["model", "backbone"])
+def test_original_transformers_persistence_matches_same_forward_oracle_and_reuses_buffers(tmp_path, decoder_name):
     class Decoder(nn.Module):
         def __init__(self):
             super().__init__()
@@ -70,7 +72,7 @@ def test_original_transformers_persistence_matches_same_forward_oracle_and_reuse
     class Wrapper(nn.Module):
         def __init__(self):
             super().__init__()
-            self.model = Decoder()
+            setattr(self, decoder_name, Decoder())
 
     model = Wrapper()
     with diagnostic.IntegrityHFExtractor(
@@ -86,7 +88,7 @@ def test_original_transformers_persistence_matches_same_forward_oracle_and_reuse
         assert {r["diagnostic_slot"] for r in receipts} == {0, 1}
         assert torch.equal(load_file(receipts[-1]["path"])["token_ids"], rows[:1, :2])
         assert sorted(extractor.pool.free) == [0, 1]
-    assert not model.model._forward_hooks
+    assert not getattr(model, decoder_name)._forward_hooks
 
 
 def test_anchor_rule_is_reported_alongside_unchanged_strict_gates():

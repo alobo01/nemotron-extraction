@@ -10,6 +10,12 @@ from torch import nn
 from .types import KINDS, HookSite
 
 
+def decoder_of(model: nn.Module) -> nn.Module:
+    """Resolve the decoder used for activation-only forwards, without vocabulary logits."""
+    backbone = getattr(model, "backbone", None)
+    return backbone if backbone is not None else getattr(model, "model", model)
+
+
 def layers_of(model: nn.Module):
     for path in ("model.layers", "backbone.layers", "layers"):
         try:

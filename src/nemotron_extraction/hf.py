@@ -13,7 +13,7 @@ import torch
 from torch import nn
 
 from .extractor import Extractor
-from .hooks import install, repair_time_step_limits
+from .hooks import decoder_of, install, repair_time_step_limits
 from .transport import SLOTS, BufferPool, capture_seconds, finish_copy, memory_peaks, publish, timeline
 from .types import ActivationBatch, DeviceActivationBatch, validate_tokens
 
@@ -141,8 +141,7 @@ class HFExtractor(Extractor):
             self.captured.clear()
             try:
                 self.model.eval()
-                decoder = getattr(self.model, "backbone", None)
-                yield decoder if decoder is not None else getattr(self.model, "model", self.model)
+                yield decoder_of(self.model)
             finally:
                 self.captured.clear()
                 self.model.train(was_training)

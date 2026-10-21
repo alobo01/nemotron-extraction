@@ -38,7 +38,7 @@ from benchlib.trace import TraceHooks, runtime_config
 from safetensors.torch import load_file, save_file
 
 from nemotron_extraction import HFExtractor, HookSite, VLLMExtractor
-from nemotron_extraction.hooks import repair_time_step_limits
+from nemotron_extraction.hooks import decoder_of, repair_time_step_limits
 from nemotron_extraction.transport import SLOTS, atomic_path
 
 # Two duplicated and two reordered prompts, truncated to keep the integrity case small.
@@ -129,7 +129,7 @@ def transformers_backend(args, rows, manifest, destination, monitor):
     repair_time_step_limits(model)
     model.eval()
     result = dict(startup_seconds=time.perf_counter() - started, runtime=runtime_config(model), cases={})
-    decoder = getattr(model, "model", model)
+    decoder = decoder_of(model)
     trace = TraceHooks(model)
     spec = replay_spec(args)
     if spec:
@@ -328,7 +328,7 @@ class IntegrityHFExtractor(HFExtractor):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.oracles = {}
-        decoder = getattr(self.model, "model", self.model)
+        decoder = decoder_of(self.model)
 
         def oracle(module, args, output):
             self.oracles[self.diag_slot] = {
@@ -342,9 +342,17 @@ class IntegrityHFExtractor(HFExtractor):
         return super()._capture(tokens, slot)
 
     def _publish(self, tokens, slot, capture, path, index):
-        oracle = self.oracles.pop(slot)
-        occupied = SLOTS - len(self.pool.free)
-        time.sleep(0.5)  # hold this slot so the next capture fills the other buffer
+        try:
+            oracle = self.oracles.pop(slot)
+            occupied = SLOTS - len(self.pool.free)
+            time.sleep(0.5)  # hold this slot so the next capture fills the other buffer
+        except BaseException:
+            # Match the base publisher's cleanup even if the diagnostic oracle fails.
+            try:
+                self._finish(capture)
+            finally:
+                self.pool.release(slot)
+            raise
         result = super()._publish(tokens, slot, capture, path, index)
         saved = load_file(result["path"])
         exact = torch.equal(saved["token_ids"], tokens) and all(torch.equal(saved[k], v) for k, v in oracle.items())
