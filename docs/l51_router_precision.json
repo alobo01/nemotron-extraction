@@ -1,0 +1,87 @@
+{
+  "scope": "CPU-only router precision diagnostic on frozen original BF16 inputs; no native GPU centering or full-model fix claimed",
+  "torch": "2.13.0+cpu",
+  "inputs": {
+    "transformers": {
+      "profiles": {
+        "fp32": {
+          "exact_cutoff_ties": 1,
+          "changed_sets_vs_fp32": 0
+        },
+        "fp32_logits_fp64_sigmoid_bias": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp32": 0
+        },
+        "fp64": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp32": 0
+        }
+      },
+      "fp32_tie_examples": [
+        {
+          "position": 327,
+          "token_id": 1993,
+          "profiles": {
+            "fp32": {
+              "ids": [
+                5,
+                16,
+                77,
+                81,
+                120,
+                121
+              ],
+              "cutoff_gap": 0.0
+            },
+            "fp32_logits_fp64_sigmoid_bias": {
+              "ids": [
+                5,
+                16,
+                77,
+                81,
+                120,
+                121
+              ],
+              "cutoff_gap": 2.4596596972514817e-06
+            },
+            "fp64": {
+              "ids": [
+                5,
+                16,
+                77,
+                81,
+                120,
+                121
+              ],
+              "cutoff_gap": 2.4143577945778816e-06
+            }
+          }
+        }
+      ]
+    },
+    "vllm": {
+      "profiles": {
+        "fp32": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp32": 0
+        },
+        "fp32_logits_fp64_sigmoid_bias": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp32": 0
+        },
+        "fp64": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp32": 0
+        }
+      },
+      "fp32_tie_examples": []
+    }
+  },
+  "cross_input_changed_sets": {
+    "fp32": 262,
+    "fp32_logits_fp64_sigmoid_bias": 262,
+    "fp64": 262
+  },
+  "model_revision": "fe4143e388795a58a92974891b2e45092a53dc1d",
+  "anchor_int64_sha256": "c5e6f8311596eba310ae9c0f181334dc5d2ae8fcbd8290d7f26ce995b30fb840"
+}

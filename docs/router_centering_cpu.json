@@ -1,0 +1,125 @@
+{
+  "L01": {
+    "bias_min": 56.722015380859375,
+    "bias_max": 56.788978576660156,
+    "profiles": {
+      "transformers": {
+        "raw_fp32": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        },
+        "centered_fp32": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        },
+        "fp64": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        }
+      },
+      "vllm": {
+        "raw_fp32": {
+          "exact_cutoff_ties": 1,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        },
+        "centered_fp32": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        },
+        "fp64": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        }
+      }
+    }
+  },
+  "L27": {
+    "bias_min": 44.288978576660156,
+    "bias_max": 44.532981872558594,
+    "profiles": {
+      "transformers": {
+        "raw_fp32": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        },
+        "centered_fp32": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        },
+        "fp64": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        }
+      },
+      "vllm": {
+        "raw_fp32": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        },
+        "centered_fp32": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        },
+        "fp64": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        }
+      }
+    }
+  },
+  "L51": {
+    "bias_min": 48.038978576660156,
+    "bias_max": 48.288978576660156,
+    "profiles": {
+      "transformers": {
+        "raw_fp32": {
+          "exact_cutoff_ties": 1,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        },
+        "centered_fp32": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        },
+        "fp64": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        }
+      },
+      "vllm": {
+        "raw_fp32": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        },
+        "centered_fp32": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        },
+        "fp64": {
+          "exact_cutoff_ties": 0,
+          "changed_sets_vs_fp64": 0,
+          "changed_sets_vs_raw_fp32": 0
+        }
+      }
+    }
+  },
+  "scope": "CPU-only router precision diagnostic on frozen original BF16 inputs; no native GPU centering or full-model fix claimed",
+  "model_revision": "fe4143e388795a58a92974891b2e45092a53dc1d",
+  "anchor_int64_sha256": "c5e6f8311596eba310ae9c0f181334dc5d2ae8fcbd8290d7f26ce995b30fb840"
+}

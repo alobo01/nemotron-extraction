@@ -1,0 +1,207 @@
+{
+  "hf": {
+    "case_count": 6,
+    "gpu": "NVIDIA GeForce RTX 3090",
+    "native_ieee_exact_2048": {
+      "in_proj_output": true,
+      "input": true,
+      "norm_output": true,
+      "output": true
+    },
+    "software": {
+      "accelerate": "1.14.0",
+      "causal-conv1d": "1.7.0",
+      "cuda": "12.9",
+      "datasets": "5.0.1",
+      "kernels": null,
+      "mamba-ssm": "2.3.2.post1",
+      "nemotron-extraction": "1.1.0",
+      "python": "3.12.3",
+      "safetensors": "0.5.3",
+      "torch": "2.8.0a0+5228986c39.nv25.5",
+      "transformers": "4.57.6",
+      "vllm": null
+    }
+  },
+  "summary": {
+    "fp32-128": {
+      "in_proj_output": {
+        "minimum_cosine": 0.9999995827674866,
+        "passed": true,
+        "relative_l2": 0.0
+      },
+      "norm_output": {
+        "minimum_cosine": 0.9999997615814209,
+        "passed": true,
+        "relative_l2": 9.207085968231284e-08
+      },
+      "output": {
+        "minimum_cosine": 0.9999993443489075,
+        "passed": true,
+        "relative_l2": 1.1117015964046782e-07
+      }
+    },
+    "fp32-2048": {
+      "in_proj_output": {
+        "minimum_cosine": 0.999999463558197,
+        "passed": true,
+        "relative_l2": 0.0
+      },
+      "norm_output": {
+        "minimum_cosine": 0.9999995827674866,
+        "passed": true,
+        "relative_l2": 9.065186009987823e-08
+      },
+      "output": {
+        "minimum_cosine": 0.9999992251396179,
+        "passed": true,
+        "relative_l2": 1.176182150843525e-07
+      }
+    },
+    "ieee-128": {
+      "in_proj_output": {
+        "minimum_cosine": 1.0,
+        "passed": true,
+        "relative_l2": 0.0
+      },
+      "norm_output": {
+        "minimum_cosine": 0.9999846816062927,
+        "passed": true,
+        "relative_l2": 0.004383552152126979
+      },
+      "output": {
+        "minimum_cosine": 0.9999862313270569,
+        "passed": true,
+        "relative_l2": 0.003037004681572229
+      }
+    },
+    "ieee-2048": {
+      "in_proj_output": {
+        "minimum_cosine": 1.0,
+        "passed": true,
+        "relative_l2": 0.0
+      },
+      "norm_output": {
+        "minimum_cosine": 0.9999785423278809,
+        "passed": true,
+        "relative_l2": 0.004312035291602506
+      },
+      "output": {
+        "minimum_cosine": 0.99997878074646,
+        "passed": true,
+        "relative_l2": 0.002908642280056436
+      }
+    },
+    "native-128": {
+      "in_proj_output": {
+        "minimum_cosine": 1.0,
+        "passed": true,
+        "relative_l2": 0.0
+      },
+      "norm_output": {
+        "minimum_cosine": 0.9999846816062927,
+        "passed": true,
+        "relative_l2": 0.004383552152126979
+      },
+      "output": {
+        "minimum_cosine": 0.999983012676239,
+        "passed": true,
+        "relative_l2": 0.003417259487968264
+      }
+    },
+    "native-2048": {
+      "in_proj_output": {
+        "minimum_cosine": 1.0,
+        "passed": true,
+        "relative_l2": 0.0
+      },
+      "norm_output": {
+        "minimum_cosine": 0.9999785423278809,
+        "passed": true,
+        "relative_l2": 0.004312035291602506
+      },
+      "output": {
+        "minimum_cosine": 0.99997878074646,
+        "passed": true,
+        "relative_l2": 0.002908642280056436
+      }
+    }
+  },
+  "vllm": {
+    "case_count": 6,
+    "gpu": "NVIDIA GeForce RTX 3090",
+    "native_ieee_exact_2048": {
+      "in_proj_output": true,
+      "input": true,
+      "norm_output": true,
+      "output": true
+    },
+    "runtime": {
+      "bfloat16": {
+        "mixer_class": "MambaMixer2",
+        "precision": {
+          "api": "modern",
+          "bf16_reduced_reduction": true,
+          "conv": "tf32",
+          "cudnn": "none",
+          "global": "none",
+          "matmul": "ieee",
+          "rnn": "tf32"
+        },
+        "verified_parameters": [
+          "A",
+          "D",
+          "dt_bias",
+          "conv1d.weight",
+          "conv1d.bias",
+          "in_proj.weight",
+          "out_proj.weight",
+          "norm.weight"
+        ]
+      },
+      "float32": {
+        "mixer_class": "MambaMixer2",
+        "precision": {
+          "api": "modern",
+          "bf16_reduced_reduction": true,
+          "conv": "tf32",
+          "cudnn": "none",
+          "global": "none",
+          "matmul": "ieee",
+          "rnn": "tf32"
+        },
+        "verified_parameters": [
+          "A",
+          "D",
+          "dt_bias",
+          "conv1d.weight",
+          "conv1d.bias",
+          "in_proj.weight",
+          "out_proj.weight",
+          "norm.weight"
+        ]
+      }
+    },
+    "software": {
+      "accelerate": null,
+      "causal-conv1d": null,
+      "cuda": "13.4",
+      "datasets": null,
+      "kernels": null,
+      "mamba-ssm": null,
+      "nemotron-extraction": "1.1.0",
+      "python": "3.12.3",
+      "safetensors": "0.8.0",
+      "torch": "2.14.0a0+4fdf77b940.nv26.8.63802676",
+      "transformers": "5.14.1",
+      "vllm": "0.27.1+93523f72.nv26.8.64249418"
+    }
+  },
+  "job_id": 3640100,
+  "remote_root": "/fscratch/alobo/nemotron-mamba-replay-20261021-v1",
+  "state": "COMPLETED",
+  "exit_code": "0:0",
+  "elapsed": "00:08:17",
+  "node": "serv-9218",
+  "scope": "Isolated original layer-0 Mamba; native/IEEE BF16 and IEEE FP32; not full-model parity"
+}

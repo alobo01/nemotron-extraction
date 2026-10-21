@@ -1,0 +1,113 @@
+{
+  "scope": "isolated_original_checkpoint_moe_replay",
+  "production_default_changed": false,
+  "full_model_agreement_verified": false,
+  "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+  "model_revision": "fe4143e388795a58a92974891b2e45092a53dc1d",
+  "anchor_tokens": 2048,
+  "anchor_int64_sha256": "c5e6f8311596eba310ae9c0f181334dc5d2ae8fcbd8290d7f26ce995b30fb840",
+  "reference_source_sha256": "52273a23a2c768ffe5938e96f6832afd762029293a8be9bfed886757ba6a39b5",
+  "layers": [
+    1,
+    27,
+    51
+  ],
+  "runtime": "Frozen NVIDIA PyTorch reference classes and native vLLM operators in one worker",
+  "environment_before_process_start": {
+    "TRITON_F32_DEFAULT": "ieee",
+    "HF_HUB_OFFLINE": "1",
+    "VLLM_WORKER_MULTIPROC_METHOD": "spawn"
+  },
+  "torch_precision": {
+    "global": "ieee",
+    "matmul": "ieee",
+    "cudnn": "ieee",
+    "conv": "ieee",
+    "rnn": "ieee",
+    "bf16_reduced_reduction": false,
+    "implementation": "benchlib.precision.ieee_precision"
+  },
+  "router": {
+    "projection_dtype": "float32",
+    "projection_implementation": "torch.nn.functional.linear in both paths; explicit vLLM gate override in harness",
+    "score": "sigmoid",
+    "correction_bias": "selection_only",
+    "groups": 1,
+    "experts": 128,
+    "top_k": 6,
+    "normalize_selected_scores": true,
+    "normalization_epsilon": 1e-20,
+    "routed_scaling_factor": 2.5,
+    "selector_controls": {
+      "native": "Actual vLLM selector, with all disagreements and cutoff margins recorded",
+      "aligned": "Explicit frozen PyTorch get_topk_indices selector in both paths; native expert kernels retained",
+      "warning": "Identical logits and routing equations do not guarantee identical selected sets at floating-point cutoffs"
+    }
+  },
+  "experts": {
+    "activation": "relu_squared",
+    "weight_values": "original BF16 checkpoint, verified after cast; no new checkpoint information",
+    "profiles": [
+      "bfloat16",
+      "float32"
+    ],
+    "reference_accumulation": "expert_index_order, float32, cast to expert dtype before adding shared expert",
+    "native_backend": "unquantized Triton; actual outputs measured rather than assuming flag equivalence"
+  },
+  "engine": {
+    "enforce_eager": true,
+    "tensor_parallel_size": 1,
+    "enable_prefix_caching": false,
+    "enable_chunked_prefill": true,
+    "max_model_len": 2049,
+    "max_num_seqs": 1,
+    "max_num_batched_tokens": 2049,
+    "skip_tokenizer_init": true,
+    "gpu_memory_utilization": 0.65,
+    "kv_cache_memory_bytes": 536870912,
+    "mamba_cache_dtype": "float32",
+    "mamba_ssm_cache_dtype": "float32"
+  },
+  "strict_gate": {
+    "mean_cosine_minimum": 0.9999,
+    "minimum_token_cosine_minimum": 0.999,
+    "relative_l2_maximum": 0.02
+  },
+  "attribution": {
+    "bad_row_thresholds": [
+      0.99,
+      0.999
+    ],
+    "intervention": "candidate input fixed; reference expert IDs; candidate-derived weights recomputed",
+    "sham": "candidate expert IDs with the same weight recomputation",
+    "interpretation": "controlled replay error reduction, including interactions; not an additive fraction of full-model error"
+  },
+  "native_fp32_tile": {
+    "environment": "VLLM_TUNED_CONFIG_FOLDER points to a private run directory",
+    "filename": "E=128,N=1856,device_name=<GPU name with spaces replaced by underscores>,dtype=float32.json",
+    "contents": {
+      "1": {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2
+      }
+    },
+    "reason": "Default FP32 tile exceeded RTX A6000 shared-memory limit (131072 required, 101376 available)",
+    "status": "validated: job 3640851 completed 0:0 on RTX A6000; all eight saved cases verified"
+  },
+  "validation": {
+    "job_id": 3640851,
+    "state": "COMPLETED",
+    "exit_code": "0:0",
+    "elapsed": "00:04:53",
+    "node": "serv-9221",
+    "gpu": "NVIDIA RTX A6000",
+    "case_count": 8,
+    "reused_bf16_case_count": 4,
+    "same_input_shared_selector_comparisons_passed": 16,
+    "results": "moe_validation_results.json"
+  }
+}
