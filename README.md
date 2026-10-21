@@ -1,122 +1,73 @@
 # Nemotron extraction
 
-Capture activations (a model's internal state for each token) from the official
-[`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
-checkpoint with Hugging Face Transformers (PyTorch) or the vLLM inference engine.
+Capture token-aligned activations from NVIDIA's [Nemotron 3 Nano 30B A3B BF16 checkpoint](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16) with either Hugging Face Transformers (PyTorch) or vLLM. Both extractors share the same interface and save one row per input token at each selected model site.
 
 ## Install
 
-Python 3.10+. vLLM requires Linux and an NVIDIA GPU.
+Python 3.10 or later is required. vLLM needs Linux and a supported NVIDIA GPU. Install the backend extras you plan to use:
 
 ```bash
 uv venv
 uv pip install 'nemotron-extraction[hf,vllm]==1.1.0'
 ```
 
-## Use
+Use `[hf]` or `[vllm]` alone to install just one backend.
 
-A hook records activations at a *site*: a zero-based layer and a kind.
+## Quick start
 
 ```python
 import torch
-from nemotron_extraction import HFExtractor, HookSite, VLLMExtractor
+from nemotron_extraction import HookSite, VLLMExtractor
 
 model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 sites = [HookSite(12, "resid_post"), HookSite(12, "attn_out_prelinear")]
-tokens = torch.tensor([[1, 2, 3]], dtype=torch.long)
+token_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
 
 with VLLMExtractor(model, sites, enable_chunked_prefill=True) as extractor:
-    batch = extractor.extract(tokens)
-    print(batch.activations["L12_resid_post"].shape)  # (3, hidden_width)
+    batch = extractor.extract(token_ids)
 
-with HFExtractor(model, sites) as extractor:  # PyTorch reference, same interface
-    batch = extractor.extract(tokens)
+print(batch.activations["L12_resid_post"].shape)  # (3, hidden_width)
 ```
 
-Both extractors also provide:
+For the PyTorch reference, replace `VLLMExtractor` with `HFExtractor` and install the `[hf]` extra. The model can also be supplied as a caller-owned PyTorch module to `HFExtractor`.
 
-- `await extract_async(token_ids)`.
-- `stream_to_disk(token_batches, output_dir)`, an async iterator of saved-shard receipts. At most two batches
-  await saving; `publication_threads=1` (default) or `2` sets how many write in parallel.
+Inputs are nonempty, rectangular `int64` token ID tensors with shape `[batch, sequence]`; padding is not supported. Each activation is a CPU tensor of shape `[batch × sequence, hidden_width]`, with sequences laid out in order. The extractor does not generate tokens.
 
-`HFExtractor.extract_device(token_ids)` instead returns the activations on the GPU for live training.
+`HookSite(layer, kind)` uses a zero-based layer index. Supported kinds are:
 
-| Site kind | Captures |
+| Kind | Captured value |
 |---|---|
-| `resid_pre`, `resid_post` | Residual stream entering / leaving the layer |
-| `mamba_out`, `moe_out`, `attn_out` | Mixer output; the layer must have that mixer |
+| `resid_pre`, `resid_post` | Residual stream entering or leaving the layer |
+| `mamba_out`, `moe_out`, `attn_out` | Layer mixer output, where that mixer exists |
 | `attn_out_prelinear` | Attention output before its output projection |
 
-Inputs are rectangular int64 `[batch, length]` token IDs without padding. Outputs are CPU tensors of shape
-`(batch × length, width)` in sequence-major order: all positions of the first sequence, then the second.
-Generated tokens are excluded.
+Both extractors support `extract_async()` and `stream_to_disk()`. Disk streaming yields saved-shard receipts and keeps at most two batches in flight. `HFExtractor.extract_device()` returns CUDA activations for live training.
 
-vLLM extraction runs eagerly with tensor parallelism one and prefix caching disabled. Enable chunked prefill
-for this checkpoint; scheduler checks reject partial prompts. Request attribution, coverage and finite-value
-checks always run. Per-token checks and capture profiling are opt-in with `diagnostics=True`.
+## Measured performance and agreement
 
-### How the vLLM backend works
+In the recorded H200 run, the package's BF16 vLLM path saved activations at **5,535 input tokens/s** versus **3,930** for Transformers at batch size 64 (**1.41×**). A sibling fill-writer implementation reached **24,079 tokens/s** (**6.13×**). These figures cover 131,072 English tokens across 18 sites and describe package version 1.0.0; they are not a measurement of version 1.1.0. Each vLLM path passed the report's strict numerical agreement gates at only 3 of 18 sites. See the one-page [speed and agreement report](docs/report.pdf), its [source](docs/report.tex), and the [timing receipts](docs/extraction_speed_results.json) for scope and limitations.
 
-Hooks run inside the GPU worker processes. The driver installs them through `collective_rpc` and submits
-token IDs. Workers reconstruct residuals, copy tensors before vLLM mutates them, and transfer them to pinned
-host buffers. The workers then write Safetensors shards, and those writes overlap inference. Request IDs
-preserve sequence order, including repeated prompts.
+## Repository guide
 
-## Validation
+- `src/nemotron_extraction/` — public extractors, model hooks, vLLM worker and shard transport.
+- `benchmarks/` — six standalone validation, throughput and attribution tools; see the [benchmark guide](benchmarks/README.md).
+- `docs/` — report, measured speed receipts and controlled numerical experiments.
+- `tests/` — package, benchmark and smoke tests.
 
-`benchmarks/validate.py` freezes inputs and compares both backends, one after the other:
+## Development
 
-```bash
-uv run benchmarks/validate.py all
-```
-
-The activations are close, but only 3 of 18 sites passed all agreement checks per language. The two backends
-are therefore not validated as interchangeable.
-
-The batch-8 sample has 16,384 tokens per language from FineWeb-Edu (English) and FineWeb2 (German, Spanish).
-Cosine measures direction (1 means aligned). Normalised mean squared error (MSE) divides total squared
-disagreement by total reference squared magnitude, so scale differences count. Zero means identical. Values
-are mean ± population standard deviation across the 18 sites.
-
-| Language | Mean cosine ± SD | Normalised MSE ± SD |
-|---|---:|---:|
-| English | 0.999002 ± 0.001144 | 0.001879 ± 0.002171 |
-| German | 0.998623 ± 0.001719 | 0.002650 ± 0.003230 |
-| Spanish | 0.998701 ± 0.001619 | 0.002435 ± 0.002989 |
-
-The cause of the discrepancy is unresolved. The default benchmark uses 1,000,000 tokens per language. Runs
-used Python 3.12, Transformers 4.57.6 with PyTorch 2.8.0a0, and vLLM 0.27.1 with PyTorch 2.14.0a0. See the
-[report](docs/report.pdf) ([source](docs/report.tex)) and [benchmarks/README.md](benchmarks/README.md) for
-the other experiments.
-
-## Repository layout
-
-```
-src/nemotron_extraction/   the installed package
-  hf.py, vllm.py             the two extractors
-  extractor.py               state and metrics they share
-  hooks.py                   Nemotron topology and hook installation
-  worker.py                  vLLM worker extension
-  transport.py               pinned buffers, timing and atomic shard writes
-  types.py                   HookSite, ActivationBatch and input validation
-benchmarks/                five entry-point scripts; benchlib/ holds their shared code (not installed)
-tests/                     package tests; tests/benchmarks/ and tests/smoke/ cover the rest
-docs/                      validation report
-```
-
-## Contributing
-
-Include a reproducer and preserve hook semantics, token ordering and attribution.
+From a checkout, install development dependencies and run the checks:
 
 ```bash
 uv sync --group dev
 uv run pytest
-uvx ruff check src benchmarks tests && uvx ruff format --check src benchmarks tests
+uvx ruff check src benchmarks tests
+uvx ruff format --check src benchmarks tests
 uv build
 ```
 
-Compile the report with `pdflatex docs/report.tex`.
+The report source can be compiled with `pdflatex -output-directory=docs docs/report.tex`.
 
-## Citation and license
+## Citation and licence
 
-Antonio Lobo-Santos, affiliated with DFKI ([BibTeX](CITATION.bib)). MIT licensed; see [LICENSE](LICENSE).
+See [CITATION.bib](CITATION.bib) for citation details. The package is MIT licensed; see [LICENSE](LICENSE). Model weights and datasets have their own licences.

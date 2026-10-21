@@ -1,38 +1,35 @@
-# Benchmarks
+# Benchmark guide
 
-Each script is a standalone entry point. Install the package with the `benchmark` extra
-(`uv pip install 'nemotron-extraction[hf,vllm,benchmark]==1.1.0'`), then run the scripts from the
-repository root. They write JSON receipts and Markdown reports into `--output`. Stages that run a model need
-a GPU; report, analysis and planning stages run on the CPU. All of them read the frozen inputs that
-`validate.py prepare` writes to `--work`.
+The scripts in this directory freeze inputs, run extractor workloads and analyse saved receipts. Model runs need the matching Transformers or vLLM environment and a suitable GPU; planning and analysis stages can run on CPU. From the repository root, install the required extras:
 
-| Script | Question it answers |
+```bash
+uv sync --extra hf --extra vllm --extra benchmark
+```
+
+Run `--help` on a script for all options. Outputs are written to the requested `--output` or run root; keep each experiment in a new directory so its receipts and source hashes remain traceable.
+
+## Entry points
+
+| Script | Use |
 |---|---|
-| `validate.py` | Do the two backends produce the same activations? (the README results) |
-| `sweep.py` | How do disk throughput and agreement change with batch size (8 to 128)? |
-| `extraction_speed.py` | How fast is this package compared with Transformers and the nemotron-sae extraction methods? |
-| `diagnose_divergence.py` | At which operation do the two backends first diverge? |
-| `precision_validation.py` | Does vLLM's layer-1 expert operation match the checkpoint's Transformers source? |
+| `validate.py` | Compare Transformers and vLLM on frozen English, German and Spanish inputs. `all` prepares inputs, runs both backends and writes a report. |
+| `sweep.py` | Measure extraction throughput and agreement across batch sizes 8–128. Run the Transformers backend before vLLM so the saved reference is available. |
+| `extraction_speed.py` | Compare Transformers, two package configurations and two nemotron-sae sibling methods. Run each method separately, then compare the receipts. |
+| `diagnose_divergence.py` | Trace backend outputs through model operations to locate and replay the first disagreement. |
+| `precision_validation.py` | Compare layer-1 expert-operation traces with the checkpoint's Transformers source. |
+| `moe_attribution.py` | Run controlled BF16 and FP32 MoE operator comparisons and expert-selection interventions. See [`../docs/moe_validation.md`](../docs/moe_validation.md) for the validated setup and findings. |
 
-## validate.py
+## Common workflows
+
+Prepare the frozen token inputs once, then run all three languages sequentially:
 
 ```bash
 uv run benchmarks/validate.py all --work outputs/tokens --output outputs/validation
 ```
 
-`all` runs `prepare` once (pin revisions, download weights, tokenize 1,000,000 tokens per language), then
-`run` for each language. `run` executes the `hf` and `vllm` backends in separate processes and writes a
-report. When a language does not fit in one cluster job:
+For a shorter validation run, use `uv run benchmarks/validate.py run --work outputs/tokens --output outputs/pilot/en-0 --language en --tokens 16384`. For split cluster jobs, use `plan` to print ranges and `aggregate` to combine completed ranges. The planning stage submits no jobs.
 
-```bash
-uv run benchmarks/validate.py run --work outputs/tokens --output pilot/en-0 --language en --tokens 16384
-# pilot de-0 and es-0 the same way
-uv run benchmarks/validate.py plan --pilot pilot                 # prints job ranges
-uv run benchmarks/validate.py run ... --start S --tokens N       # one job per range
-uv run benchmarks/validate.py aggregate --ranges r0 r1 ... --output outputs/validation/en
-```
-
-## sweep.py
+To measure batch-size throughput, first run Transformers and then vLLM for each size, followed by the report stage:
 
 ```bash
 uv run benchmarks/sweep.py backend --backend hf --batch-size 8 --work outputs/tokens --output outputs/sweep
@@ -40,62 +37,31 @@ uv run benchmarks/sweep.py backend --backend vllm --batch-size 8 --work outputs/
 uv run benchmarks/sweep.py report --output outputs/sweep
 ```
 
-Run `hf` before `vllm`, because the vLLM phase compares against the saved Transformers shards. Interrupted
-phases resume from their last committed shard. `schedule` estimates job lengths from pilot runs.
-
-## extraction_speed.py
+The recorded speed study additionally requires a local nemotron-sae snapshot containing its `worker.py` and `attention.py`. Run all five methods in separate processes with the same work inputs and reference tree, then compare their receipts:
 
 ```bash
-uv run benchmarks/extraction_speed.py run --method transformers --batch-size 8 \
-    --work outputs/tokens --reference path/to/nemotron-sae-snapshot --output outputs/speed
-uv run benchmarks/extraction_speed.py compare --work outputs/tokens --reference ... --output outputs/speed
+for method in transformers package_baseline package_optimized sibling_files sibling_fills; do
+  uv run benchmarks/extraction_speed.py run --method "$method" --batch-size 8 --work outputs/tokens --reference path/to/nemotron-sae --output outputs/speed
+done
+uv run benchmarks/extraction_speed.py compare --work outputs/tokens --reference path/to/nemotron-sae --output outputs/speed
 ```
 
-The methods are `transformers`, `package_baseline`, `package_optimized`, `sibling_files` and
-`sibling_fills`, at batch sizes 8 and 64. Run each method in its own process; the batch-8 `transformers` run
-is the numerical reference. `--reference` points to copies of nemotron-sae's `worker.py` and `attention.py`.
+The supported methods are `transformers`, `package_baseline`, `package_optimized`, `sibling_files` and `sibling_fills`; batch sizes are 8 and 64. The report in [`../docs/report.pdf`](../docs/report.pdf) records the exact workload, source hashes and timing caveats.
 
-## diagnose_divergence.py
+For divergence analysis, run `inspect`, collect one trace per backend with `backend`, then use `analyse`. The `moe-replay` stage isolates layer 1. `precision_validation.py` consumes those traces plus the pinned model source and both source checksums; see `--help` for the required paths and hashes.
 
-```bash
-uv run benchmarks/diagnose_divergence.py inspect --work outputs/tokens --reference ... --output outputs/diagnosis
-uv run benchmarks/diagnose_divergence.py backend --backend transformers --work outputs/tokens --reference ... --output outputs/diagnosis
-uv run benchmarks/diagnose_divergence.py backend --backend vllm --work outputs/tokens --reference ... --output outputs/diagnosis
-uv run benchmarks/diagnose_divergence.py analyse --output outputs/diagnosis
-```
-
-`analyse` names the first failing boundary and selects an operation to replay. Rerun both backends with
-`--replay-selection outputs/diagnosis/analysis.json` and analyse again. `--integrity` checks transfer and
-persistence against same-forward snapshots. `moe-replay` isolates the layer-1 mixture of experts.
-
-## precision_validation.py
-
-```bash
-uv run benchmarks/precision_validation.py --work outputs/tokens --output outputs/precision \
-    --transformers-trace T.safetensors --vllm-trace V.safetensors \
-    --reference-source modeling_nemotron_h.py --reference-source-sha256 ... --upstream-source-sha256 ...
-```
-
-The traces are anchor traces from `diagnose_divergence.py backend`.
+The MoE attribution harness uses a separate run root and staged reference source, traces and checkpoint weights. Follow its command sequence in [`../docs/moe_validation.md`](../docs/moe_validation.md); its verification stage checks the saved receipts and tensors without rerunning the experiment.
 
 ## Environment settings
 
 | Variable | Used by | Effect |
 |---|---|---|
-| `NH_SINK_DIR` | validate, sweep | Directory for vLLM's temporary shards |
-| `NH_GPU_MEMORY_UTILIZATION` | validate | vLLM memory fraction (default 0.96) |
-| `NH_KV_CACHE_BYTES` | sweep, extraction_speed | vLLM KV-cache size; sweep defaults to 1536 MiB, extraction_speed lets vLLM size it |
-| `NH_ENABLE_CHUNKED_PREFILL` | extraction_speed | Set `0` to disable chunked prefill (default on) |
-| `NH_RUN_STORAGE_LIMIT_BYTES` | extraction_speed | Abort before writes would exceed this budget |
+| `NH_SINK_DIR` | `validate.py`, `sweep.py` | Place temporary vLLM shards on the selected filesystem. |
+| `NH_GPU_MEMORY_UTILIZATION` | `validate.py` | Set the vLLM GPU memory fraction (default `0.96`). |
+| `NH_KV_CACHE_BYTES` | `sweep.py`, `extraction_speed.py` | Set the vLLM KV-cache budget; the sweep default is 1,536 MiB, while the speed harness lets vLLM size it. |
+| `NH_ENABLE_CHUNKED_PREFILL` | `extraction_speed.py` | Enable or disable chunked prefill (default enabled). |
+| `NH_RUN_STORAGE_LIMIT_BYTES` | `extraction_speed.py` | Stop before a run exceeds its storage budget. |
 
-## benchlib/
+## Shared benchmark code
 
-Shared code, imported by module name because the scripts run from this directory:
-
-- `common`: pinned inputs and provenance.
-- `stats`: agreement metrics.
-- `instrumentation`: GPU sampling.
-- `sibling`: the nemotron-sae driver.
-- `trace`, `workers`, `moe`, `precision`, `divergence`: diagnostics.
-
-vLLM loads `benchlib.workers` and `benchlib.sibling` worker classes by name inside its worker processes.
+`benchlib/` contains input and provenance helpers, agreement metrics, instrumentation, trace and worker support, and the sibling implementation. vLLM imports worker classes by module name inside its worker processes, so keep `benchmarks/` on `PYTHONPATH` when launching a custom worker environment.
