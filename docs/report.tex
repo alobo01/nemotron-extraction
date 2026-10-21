@@ -1,94 +1,55 @@
 \documentclass[10pt,a4paper]{article}
-\usepackage[margin=22mm]{geometry}
+\usepackage[margin=20mm]{geometry}
 \usepackage{booktabs}
 \usepackage[T1]{fontenc}
+\usepackage{lmodern}
 \usepackage{hyperref}
-\hypersetup{colorlinks=true,urlcolor=blue,linkcolor=blue,pdftitle={Nemotron activation extraction: validation note},pdfauthor={Antonio Lobo-Santos, DFKI}}
+\hypersetup{colorlinks=true,urlcolor=blue,linkcolor=blue,pdftitle={Nemotron activation extraction: output speed and numerical agreement},pdfauthor={Antonio Lobo-Santos, DFKI}}
 \setlength{\parindent}{0pt}
 \setlength{\parskip}{4pt}
 \begin{document}
 \begin{center}
-{\Large\bfseries Nemotron activation extraction}\par\vspace{3pt}
-{\small Antonio Lobo-Santos, DFKI}\par
-{\small Version 1.0.0, 19 October 2026}
+{\Large\bfseries Nemotron activation extraction}\par\vspace{2pt}
+{\small Output speed and numerical agreement --- Antonio Lobo-Santos, DFKI --- 21 October 2026}
 \end{center}
 
-Activations describe a model's internal state as it processes tokens.
-A hook records these activations at a chosen location, called a site.
-\texttt{nemotron-extraction} provides six hook types for the official
-\href{https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}{Nemotron 3 Nano BF16 checkpoint}.
-We compare two backends: Hugging Face Transformers, which runs the model with
-PyTorch, and vLLM, an inference engine that manages model execution.
-The comparison tests whether their activations meet fixed numerical agreement criteria.
+On one H200, the package saves activations at \textbf{5,535 tokens/s versus 3,930 for Transformers} at batch 64 (\textbf{1.41$\times$}). The sibling fill writer reaches \textbf{24,079 tokens/s} (\textbf{6.13$\times$}). We assess both output speed and numerical agreement of these activations: the model's internal vectors at selected recording points, or sites.
 
-vLLM runs the model in worker processes on the graphics processor (GPU).
-The driver installs hooks there through \texttt{collective\_rpc}; workers
-preserve prompt order and save captures through pinned host buffers.
-A two-batch queue allows transfers and writes to overlap inference.
-Detailed token checking and capture profiling are optional. Request attribution,
-prompt coverage and finite-value checks remain enabled. One or two publication
-threads share the same two-buffer bound; the default remains one thread.
-
-The backends produce similar activations, but only 3/18 sites per language meet
-all agreement thresholds. Interchangeability therefore remains unvalidated.
-To reach this conclusion, we supplied identical bfloat16 (BF16) weights and frozen token IDs.
-Both used checkpoint revision \texttt{fe4143e388795a58a9297\allowbreak4891b2e45092a53dc1d}.
-The validation sample used 16,384 tokens per language, batches of eight
-2,048-token sequences, and 18 sites: first, middle and last eligible layer for
-each hook type. English came from FineWeb-Edu; German and Spanish from FineWeb2.
-
-Cosine measures whether activation vectors point in the same direction, with
-1 indicating alignment. To compare errors across activation scales, we divide
-both backends' tensors by the reference root mean square at each site before
-computing mean squared error (MSE). Hugging Face Transformers is the reference,
-so normalised MSE is
-$\sum(v-h)^2/\sum h^2$, where $h$ and $v$ denote the reference and vLLM activations, summed over tokens and
-dimensions. This dimensionless measure equals relative L2 squared. Using a
-shared scale preserves magnitude differences. Zero means identical values.
-The table gives means and population standard deviations (SD) across 18 equally weighted sites, describing
-variation between sites rather than uncertainty in the mean.
-
+\textbf{Output speed.} We record 18 sites across six hook types in the official \href{https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}{Nemotron 3 Nano BF16 checkpoint}. For a consistent comparison, each table entry processes the same 131,072 frozen English tokens in 512-token sequences on the same physical H200, after two warm-up batches. Output tokens/s counts input tokens whose activations are saved at all sites, including capture, transfer, buffer waits and completed writes. Loading, warm-up and numerical comparison are excluded. GPU forward speed separately measures model execution.
 \begin{center}
-\begin{tabular}{lrr}
+\small
+\begin{tabular}{lrrrr}
 \toprule
-Language & Mean cosine $\pm$ SD & Normalised MSE $\pm$ SD \\
+ & \multicolumn{2}{c}{Output tokens/s} & Output ratio & Forward tokens/s\\
+Method & Batch 8 & Batch 64 & Batch 64 / HF & Batch 64\\
 \midrule
-English & $0.999002 \pm 0.001144$ & $0.001879 \pm 0.002171$ \\
-German  & $0.998623 \pm 0.001719$ & $0.002650 \pm 0.003230$ \\
-Spanish & $0.998701 \pm 0.001619$ & $0.002435 \pm 0.002989$ \\
+Transformers (HF/PyTorch) & 3,490 & 3,930 & 1.00$\times$ & 24,679\\
+Package vLLM asynchronous & 6,406 & 5,535 & 1.41$\times$ & 65,481\\
+Sibling vLLM file sink & 2,986 & 2,724 & 0.69$\times$ & 67,474\\
+Sibling vLLM fill writer & 20,928 & 24,079 & 6.13$\times$ & 67,087\\
 \bottomrule
 \end{tabular}
 \end{center}
-High average cosine therefore does not establish agreement. Each site must meet
-mean cosine $\geq0.9999$, minimum token cosine $\geq0.9990$, and relative L2
-$\leq0.02$ (normalised MSE $\leq0.0004$). These criteria are unchanged.
-Normalised MSE was recomputed from saved sums without rerunning inference.
-The table describes this validation sample, while the benchmark defaults to
-one million tokens per language. The cause of the discrepancy remains unresolved.
+The package peaks at 6,406 output tokens/s across five batch sizes (8--128): 1.84$\times$ Transformers at batch 8. At batch 64, however, similar vLLM forward speeds yield markedly different output rates. Model execution speed alone therefore does not predict extraction throughput. These complete paths differ in publication and finite-value checks. All use eager BF16 execution; vLLM enables chunked prefill and automatic KV-cache sizing. Requested batch sizes limit admission; actual forward batches may be smaller.
 
-For a 2,048-token English diagnostic anchor, each backend's saved trace exactly
-matched its captured values. The vLLM scheduler confirmed a whole prompt with
-zero previously computed tokens. This establishes trace persistence and prompt
-coverage. Differences in computational kernels and mixture-of-experts routing
-remain possible explanations for the numerical discrepancy, without a confirmed cause.
+\textbf{Numerical agreement.} To assess output agreement, we compare each vLLM path with Transformers (HF/PyTorch). Cosine measures directional alignment; relative L2 measures error relative to the reference magnitude. Each site must achieve mean cosine $\geq0.9999$, minimum token cosine $\geq0.9990$, and relative L2 $\leq0.02$. All three paths pass only 3/18 sites. Similarly, a BF16 sample of 16,384 tokens per language gives mean site cosine 0.999002 (English), 0.998623 (German) and 0.998701 (Spanish). High averages therefore conceal token outliers. Normalised MSE equals relative L2 squared.
 
-Both backends ran eagerly in BF16 on an H100 80GB. Hugging Face Transformers used PyTorch 2.8.0a0,
-CUDA 12.9, Transformers 4.57.6, Mamba-SSM 2.3.2.post1 and causal-conv1d 1.7.0;
-vLLM used version 0.27.1, PyTorch 2.14.0a0, CUDA 13.4 and Transformers 5.14.1.
-Thus, identical weights and inputs did not imply identical numerical kernels.
-A controlled attempt to run Transformers in the vLLM environment failed because
-\texttt{mamba-ssm} could not be imported. The software-stack difference therefore
-remains unresolved.
+\textbf{Explaining the differences.} To separate local arithmetic error from upstream differences, we replay individual operations with original weights and identical saved 2,048-token inputs. On RTX A6000, PyTorch and vLLM mixture-of-experts (MoE) operations share a runtime, FP32 routing, top-six selection among 128 experts and normalised weights scaled by 2.5. Both use IEEE settings, disable reduced BF16 reductions and share the selector to align ties. Across layers 1, 27 and 51, mean cosine rises from 0.9999948--0.9999995 in BF16 to 1.0000000 in FP32 (rounded); worst-token cosine rises from 0.9999882 to 0.9999993. Maximum relative L2 falls from 0.00365 to $1.05\times10^{-6}$; all 16 comparisons pass. Likewise, the first Mamba block on RTX 3090 gives relative L2 0.00291 in BF16 and $1.18\times10^{-7}$ in FP32. IEEE flags alone leave its BF16 output unchanged.
 
-The diagnostic script traces a 128-token anchor and its full 2,048-token sequence.
-The speed script uses 64 frozen English sequences, batches of 8 and 64, and
-three repetitions. It separates startup, extraction and comparison, measuring
-prompt activations saved to disk after warmup. These scripts define the
-investigation; no new speedup is claimed here.
+We then assess expert selection using the differing saved backend inputs. Keeping vLLM's input fixed, we force the reference expert IDs and recompute their weights in BF16. Each layer has 2,048 tokens:
+\begin{center}
+\small
+\begin{tabular}{rrrrr}
+\toprule
+Layer & Changed sets & Single-expert swaps & Tokens with cosine $<0.99$ & Squared error removed\\
+\midrule
+1 & 39 & 39 & $4\to0$ & 64.6\%\\
+27 & 356 & 342 & $276\to73$ & 40.5\%\\
+51 & 261 & 256 & $7\to3$ & 17.4\%\\
+\bottomrule
+\end{tabular}
+\end{center}
+At cosine $<0.999$, token counts fall from 28 to 0, 1,005 to 885 and 139 to 96, respectively. Among tokens recovered above 0.99, single-expert swaps account for 4, 193 and 3 recoveries. Defining a near tie as a corrected sixth/seventh score gap $\leq0.001$ gives only 3, 23 and 0 recoveries. Selection therefore explains some discrepancies, particularly at layer 1, while deeper errors extend beyond near ties. These effects interact with upstream error and cannot be added across layers.
 
-\textbf{Reproduction.}
-Build with \texttt{uv build}, install the wheel with \texttt{uv pip install},
-then follow the README's benchmark commands. Scripts save JSON receipts and
-Markdown reports. Compile \texttt{report.tex} with \texttt{pdflatex}. Citation metadata
-is in \texttt{CITATION.bib}.
+\textbf{Scope and evidence.} The output rates describe package 1.0.0 in BF16; the FP32 results validate individual operations. Full-model FP32 agreement and output speed remain unmeasured. All runs pin the same checkpoint revision. Source hashes and timings: \path{docs/extraction_speed_results.json}. Arithmetic configuration and evidence: \path{docs/matched_precision.json}, \path{docs/moe_validation.md}.
 \end{document}
