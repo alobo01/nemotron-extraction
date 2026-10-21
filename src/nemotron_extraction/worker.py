@@ -116,10 +116,10 @@ class ActivationHookExtension:
                 raise RuntimeError("Requires whole-prefill prompts; partial prefill is unsupported")
             if prompt_index in wave["covered"]:
                 raise RuntimeError("Prompt captured twice")
-            if self.nh_diagnostics and not torch.equal(
-                batch.token_ids_cpu[index, :length], wave["tokens"][prompt_index]
-            ):
-                raise RuntimeError("Worker input token IDs differ from submitted prompt")
+            if self.nh_diagnostics:
+                token_ids = batch.token_ids_cpu[index, :length]
+                if token_ids.tolist() != wave["tokens"][prompt_index].tolist():
+                    raise RuntimeError("Worker input token IDs differ from submitted prompt")
             spans.append((prompt_index, start, end))
             wave["scheduler"].append(
                 dict(

@@ -136,6 +136,17 @@ def test_detailed_token_validation_is_opt_in_but_scheduler_checks_remain(worker,
     assert not worker.nh_active["covered"]
 
 
+def test_detailed_token_validation_accepts_numpy_scheduler_tokens(worker, tmp_path):
+    worker.nh_diagnostics = True
+    worker.nh_begin("tokens", ["a"], [[1, 2]], str(tmp_path / "tokens.safetensors"))
+    worker.model_runner.input_batch = SimpleNamespace(
+        req_ids=["a"], token_ids_cpu=torch.tensor([[1, 2]]).numpy(), num_computed_tokens_cpu=[0]
+    )
+    worker.model_runner.query_start_loc = SimpleNamespace(cpu=torch.tensor([0, 2]))
+    worker.model_runner.model(torch.tensor([1, 2]), torch.tensor([0, 1]))
+    assert worker.nh_active["covered"] == {0}
+
+
 def test_fast_path_does_not_read_per_token_cpu_content(worker, tmp_path):
     class SchedulerTokens:
         def __getitem__(self, key):
