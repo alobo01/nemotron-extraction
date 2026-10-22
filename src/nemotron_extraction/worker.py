@@ -8,7 +8,16 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 
 from .hooks import install
-from .transport import BufferPool, capture_seconds, finish_copy, memory_peaks, publish, seconds, timeline
+from .transport import (
+    BufferPool,
+    capture_seconds,
+    finish_copy,
+    memory_peaks,
+    publish,
+    publish_site_directory,
+    seconds,
+    timeline,
+)
 from .types import HookSite, validate_publication_threads
 
 
@@ -24,8 +33,20 @@ def external_request_id(rid, known):
 
 
 class ActivationHookExtension:
-    def nh_install(self, sites, sink_dir, diagnostics=False, publication_threads=1):
+    def nh_install(
+        self,
+        sites,
+        sink_dir,
+        diagnostics=False,
+        publication_threads=1,
+        publication_layout="monolithic",
+        site_write_threads=8,
+    ):
         validate_publication_threads(publication_threads)
+        if publication_layout not in ("monolithic", "per_site") or not 1 <= site_write_threads <= 8:
+            raise ValueError("Invalid publication layout or site writer count")
+        self.nh_publication_layout = publication_layout
+        self.nh_site_writer = ThreadPoolExecutor(max_workers=site_write_threads)
         self.nh_diagnostics = diagnostics
         self.nh_captured = {}
         self.nh_capture_events = []
@@ -41,6 +62,7 @@ class ActivationHookExtension:
         self.nh_origin_cpu = time.perf_counter()
         specs = [HookSite(**site) for site in sites]
         self.nh_keys = [site.key for site in specs]
+        self.nh_enabled_keys = list(self.nh_keys)
         model = self.model_runner.model
         try:
             self.nh_handles, self.nh_topology = install(
@@ -59,9 +81,18 @@ class ActivationHookExtension:
         except BaseException:
             self.nh_copy.shutdown()
             self.nh_writer.shutdown()
+            self.nh_site_writer.shutdown()
             raise
         torch.cuda.reset_peak_memory_stats()
         return self.nh_topology
+
+    def nh_set_sites(self, keys):
+        if self.nh_active is not None or self.nh_pending:
+            raise RuntimeError("Drain publications before changing active sites")
+        if not keys or len(set(keys)) != len(keys) or not set(keys) <= set(self.nh_keys):
+            raise ValueError("Active sites must be a nonempty subset of installed hooks")
+        self.nh_enabled_keys = list(keys)
+        return True
 
     def nh_begin(self, wave_id, request_ids, token_ids, path):
         if self.nh_active is not None or wave_id in self.nh_pending:
@@ -81,6 +112,10 @@ class ActivationHookExtension:
             "path": path,
             "tensors": {"token_ids": tokens},
             "copies": [],
+            "finite_flags": [],
+            "layout": self.nh_publication_layout,
+            "keys": list(self.nh_enabled_keys),
+            "site_writer": self.nh_site_writer,
             "covered": set(),
             "forward_events": [],
             "forward_batches": [],
@@ -148,6 +183,7 @@ class ActivationHookExtension:
         self.nh_capture_events.clear()
         if set(captured) != set(self.nh_keys):
             raise RuntimeError("Captured site set differs from requested sites")
+        captured = {key: captured[key] for key in wave["keys"]}
         stream = torch.cuda.current_stream()
         started, ended = (torch.cuda.Event(enable_timing=True) for _ in range(2))
         total_rows = wave["tokens"].numel()
@@ -158,6 +194,14 @@ class ActivationHookExtension:
             for key, source in captured.items():
                 if source.ndim != 2 or any(stop > source.shape[0] for _, _, stop in self.nh_spans):
                     raise RuntimeError(f"{key}: capture shape does not cover scheduler spans")
+                if wave["layout"] == "per_site":
+                    finite = torch.stack([torch.isfinite(chunk).all() for chunk in source.split(8192)]).all()
+                    flag = self.nh_pool.tensor(
+                        wave["slot"], key + "_finite_" + str(len(wave["finite_flags"])), (), torch.bool, pinned=True
+                    )
+                    flag.copy_(finite, non_blocking=True)
+                    # A wave may contain several forwards; keep each result independently.
+                    wave["finite_flags"].append((key, flag))
                 host = self.nh_pool.tensor(wave["slot"], key, (total_rows, source.shape[-1]), source.dtype, pinned=True)
                 wave["tensors"][key] = host
                 self.nh_topology[key]["width"] = source.shape[-1]
@@ -187,7 +231,15 @@ class ActivationHookExtension:
         copy_seconds = sum(copy.result() for copy in wave["copies"])
         forward_seconds = sum(seconds(start, end) for start, end in wave["forward_events"])
         write_start = time.perf_counter() - wave["origin_cpu"]
-        receipt = publish(wave["tensors"], wave["path"], {"wave_id": wave["id"]})
+        if wave.get("layout") == "per_site":
+            for key, flag in wave["finite_flags"]:
+                if not bool(flag):
+                    raise ValueError(f"{key}: nonfinite activations")
+            receipt = publish_site_directory(
+                wave["tensors"], wave["path"], wave["site_writer"], {"wave_id": wave["id"]}
+            )
+        else:
+            receipt = publish(wave["tensors"], wave["path"], {"wave_id": wave["id"]})
         receipt.update(
             wave["memory"],
             wave_id=wave["id"],
@@ -224,6 +276,7 @@ class ActivationHookExtension:
         try:
             self.nh_copy.shutdown(wait=True)
             self.nh_writer.shutdown(wait=True)
+            self.nh_site_writer.shutdown(wait=True)
             for _, future in self.nh_pending.values():
                 future.result()
         finally:

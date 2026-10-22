@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 from dataclasses import asdict
 
 import torch
@@ -37,7 +38,13 @@ class VLLMExtractor(Extractor):
         diagnostics=False,
         publication_threads=1,
         auto_batch_config=None,
+        publication_layout="monolithic",
+        site_write_threads=8,
     ):
+        if publication_layout not in ("monolithic", "per_site") or not 1 <= site_write_threads <= 8:
+            raise ValueError("Invalid publication layout or site writer count")
+        self.publication_layout = publication_layout
+        self.site_write_threads = site_write_threads
         super().__init__(sites, diagnostics, publication_threads)
         automatic = sequences_per_call == "auto"
         if (not automatic and sequences_per_call < 1) or max_model_len < 2 or not 0 < gpu_memory_utilization <= 1:
@@ -45,9 +52,9 @@ class VLLMExtractor(Extractor):
         self.auto_batch_config = auto_batch_config
         if automatic:
             if auto_batch_config is None:
-                raise ValueError('Automatic extraction batching needs an AutoBatchConfig memory profile')
-            free,total=torch.cuda.mem_get_info()
-            sequences_per_call=auto_batch_config.fit(total,gpu_memory_utilization,external_used_bytes=total-free)
+                raise ValueError("Automatic extraction batching needs an AutoBatchConfig memory profile")
+            free, total = torch.cuda.mem_get_info()
+            sequences_per_call = auto_batch_config.fit(total, gpu_memory_utilization, external_used_bytes=total - free)
         self.sequence_ceiling = sequences_per_call
         self.sequences_per_call, self.max_model_len = sequences_per_call, max_model_len
         self.enable_chunked_prefill = enable_chunked_prefill
@@ -68,6 +75,21 @@ class VLLMExtractor(Extractor):
         except BaseException:
             self.close()
             raise
+
+    def shard_path(self, output_dir, index):
+        if self.publication_layout == "per_site":
+            return Path(output_dir) / f"{index:06d}"
+        return super().shard_path(output_dir, index)
+
+    def set_active_sites(self, sites):
+        """Reduce captured publications at a drained boundary without reloading the model."""
+        keys = [site.key for site in sites]
+
+        async def update():
+            async with self.lock:
+                await self.llm.collective_rpc("nh_set_sites", args=(keys,))
+
+        return self._future(update()).result()
 
     def _future(self, coroutine):
         return asyncio.run_coroutine_threadsafe(coroutine, self.loop)
@@ -103,7 +125,14 @@ class VLLMExtractor(Extractor):
         self.topology = (
             await self.llm.collective_rpc(
                 "nh_install",
-                args=([asdict(s) for s in self.sites], self.sink.name, self.diagnostics, self.publication_threads),
+                args=(
+                    [asdict(s) for s in self.sites],
+                    self.sink.name,
+                    self.diagnostics,
+                    self.publication_threads,
+                    self.publication_layout,
+                    self.site_write_threads,
+                ),
             )
         )[0]
         self.hook_install_seconds = time.perf_counter() - started
@@ -124,14 +153,14 @@ class VLLMExtractor(Extractor):
             self.actual_forward_batches.extend(receipt["actual_forward_batches"])
             self._fold_memory(receipt)
             if self.auto_batch_config is not None:
-                total=receipt.get('total_device_memory_bytes',0)
-                peak=receipt.get('peak_device_memory_bytes',0)
-                if total and peak > self.gpu_memory_utilization*total:
-                    frame=self.auto_batch_config.frame_sequences
-                    next_size=max(frame,(self.sequences_per_call-frame)//frame*frame)
-                    if next_size==self.sequences_per_call:
-                        raise MemoryError('One extraction archive frame exceeds the device memory target')
-                    self.sequences_per_call=next_size
+                total = receipt.get("total_device_memory_bytes", 0)
+                peak = receipt.get("peak_device_memory_bytes", 0)
+                if total and peak > self.gpu_memory_utilization * total:
+                    frame = self.auto_batch_config.frame_sequences
+                    next_size = max(frame, (self.sequences_per_call - frame) // frame * frame)
+                    if next_size == self.sequences_per_call:
+                        raise MemoryError("One extraction archive frame exceeds the device memory target")
+                    self.sequences_per_call = next_size
         return ready
 
     async def _generate(self, tokens, ids):
@@ -289,7 +318,12 @@ class VLLMExtractor(Extractor):
             started = time.perf_counter()
             parts = {site.key: [] for site in self.sites}
             for receipt in receipts:
-                tensors = await asyncio.to_thread(load_file, receipt["path"])
+                if receipt.get("layout") == "per_site":
+                    tensors = {}
+                    for key, record in receipt["files"].items():
+                        tensors.update(await asyncio.to_thread(load_file, record["path"]))
+                else:
+                    tensors = await asyncio.to_thread(load_file, receipt["path"])
                 for key in parts:
                     parts[key].append(tensors[key])
             self.driver_read_seconds += time.perf_counter() - started

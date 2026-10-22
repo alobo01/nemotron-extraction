@@ -43,6 +43,8 @@ Inputs are nonempty, rectangular `int64` token ID tensors with shape `[batch, se
 
 Both extractors support `extract_async()` and `stream_to_disk()`. Disk streaming yields saved-shard receipts and keeps at most two batches in flight. `HFExtractor.extract_device()` returns CUDA activations for live training.
 
+For independently consumed site caches, `VLLMExtractor(..., publication_layout="per_site", site_write_threads=8)` writes each tensor to its own file and atomically publishes the containing directory. Version-2 receipts include paths, shapes, sizes and SHA-256 tensor checksums. This opt-in path validates finite values on the GPU before publication and avoids a CPU finite scan. `set_active_sites(sites)` can reduce the published sites between drained streams without reloading the model. The default monolithic layout remains unchanged.
+
 For memory-bounded vLLM chunk sizes, set `sequences_per_call="auto"` and pass an `AutoBatchConfig` from `nemotron_extraction.batching`. Build its profile from a reference run; it accounts for model memory, per-sequence peak use, host capture and publication budgets.
 
 ## Measured performance and agreement

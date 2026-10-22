@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import threading
+import hashlib
+import json
+import os
+import shutil
+import uuid
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -137,3 +142,83 @@ def publish(tensors, path, metadata=None):
         "publication_seconds": finished - serialized,
         "write_seconds": finished - started,
     }
+
+
+def tensor_sha256(tensor):
+    return hashlib.sha256(memoryview(tensor.contiguous().view(torch.uint8).numpy())).hexdigest()
+
+
+def publish_site_directory(tensors, path, writer, metadata=None):
+    """Publish immutable site files together, with hashes from completed host buffers.
+
+    The caller must have checked floating-point values before submitting this
+    operation. The vLLM per-site path does so on the device before its copy ends.
+    """
+    path = Path(path)
+    if path.exists():
+        raise FileExistsError(path)
+    partial = path.with_name(path.name + "." + uuid.uuid4().hex + ".partial")
+    partial.mkdir(parents=True)
+    started = time.perf_counter()
+
+    def write(key, tensor):
+        if not key or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" for c in key):
+            raise ValueError("Unsafe tensor file key")
+        file = partial / (key + ".safetensors")
+        digest = tensor_sha256(tensor)
+        save_file({key: tensor}, str(file), metadata=metadata)
+        with file.open("r+b") as handle:
+            os.fsync(handle.fileno())
+        return key, dict(
+            path=str(path / file.name),
+            sha256=digest,
+            shape=list(tensor.shape),
+            dtype=str(tensor.dtype),
+            bytes=file.stat().st_size,
+        )
+
+    try:
+        futures = [writer.submit(write, key, tensor) for key, tensor in tensors.items()]
+        files = {}
+        error = None
+        for future in futures:
+            try:
+                key, value = future.result()
+                files[key] = value
+            except BaseException as exc:
+                error = error or exc
+        if error is not None:
+            raise error
+        manifest = dict(version=2, layout="per_site", files=files, finite_validation="device")
+        with (partial / "receipt.json").open("x") as handle:
+            json.dump(manifest, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        total = sum(p.stat().st_size for p in partial.iterdir())
+        # Publish only after every site file and receipt is complete.
+        if os.name != "nt":
+            fd = os.open(partial, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        os.rename(partial, path)
+        if os.name != "nt":
+            fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    except BaseException:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise
+    finished = time.perf_counter()
+    return dict(
+        manifest,
+        path=str(path),
+        bytes=total,
+        validation_seconds=0.0,
+        serialization_seconds=finished - started,
+        publication_seconds=0.0,
+        write_seconds=finished - started,
+    )

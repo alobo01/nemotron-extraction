@@ -164,3 +164,31 @@ def test_fast_path_does_not_read_per_token_cpu_content(worker, tmp_path):
         dict(request_id="a", sequence_index=0, start=0, stop=2, computed_tokens=0, prompt_length=2)
     ]
     assert r["validation_seconds"] >= 0 and r["serialization_seconds"] >= 0
+
+
+def test_per_site_worker_checks_every_forward_and_keeps_row_identity(worker, tmp_path):
+    worker.nh_publication_layout = "per_site"
+    rows = [[1, 2], [3, 4]]
+    worker.nh_begin("sites", ["a", "b"], rows, str(tmp_path / "wave"))
+    forward(worker, ["a"], [rows[0]])
+    forward(worker, ["b"], [rows[1]])
+    worker.nh_seal("sites")
+    receipt = poll(worker)[0]
+    assert receipt["finite_validation"] == "device"
+    assert load_file(receipt["files"]["L0_resid_post"]["path"])["L0_resid_post"].flatten().tolist() == [4, 7, 10, 13]
+    assert sorted(worker.nh_pool.free) == [0, 1]
+
+
+def test_active_site_reduction_waits_for_a_drained_boundary(worker, tmp_path):
+    worker.nh_publication_layout = "per_site"
+    worker.nh_set_sites(["L0_resid_post"])
+    worker.nh_begin("reduced", ["a"], [[1, 2]], str(tmp_path / "wave"))
+    with pytest.raises(RuntimeError, match="Drain"):
+        worker.nh_set_sites(["L0_resid_pre"])
+    forward(worker, ["a"], [[1, 2]])
+    worker.nh_seal("reduced")
+    receipt = poll(worker)[0]
+    assert set(receipt["files"]) == {"token_ids", "L0_resid_post"}
+    worker.nh_set_sites(["L0_resid_pre"])
+    with pytest.raises(ValueError, match="subset"):
+        worker.nh_set_sites(["wrong"])
