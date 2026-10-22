@@ -55,6 +55,7 @@ class VLLMExtractor(Extractor):
                 raise ValueError("Automatic extraction batching needs an AutoBatchConfig memory profile")
             free, total = torch.cuda.mem_get_info()
             sequences_per_call = auto_batch_config.fit(total, gpu_memory_utilization, external_used_bytes=total - free)
+        self.last_memory_window = {}
         self.sequence_ceiling = sequences_per_call
         self.sequences_per_call, self.max_model_len = sequences_per_call, max_model_len
         self.enable_chunked_prefill = enable_chunked_prefill
@@ -88,6 +89,25 @@ class VLLMExtractor(Extractor):
         async def update():
             async with self.lock:
                 await self.llm.collective_rpc("nh_set_sites", args=(keys,))
+
+        return self._future(update()).result()
+
+    def set_sequences_per_call(self, sequences):
+        """Set the next call's geometry after all current publications have drained.
+
+        The engine capacity stays fixed, so changing extraction wave size never
+        reloads the model. Archive users must build reservations after this call.
+        """
+        frame = self.auto_batch_config.frame_sequences if self.auto_batch_config else 1
+        if type(sequences) is not int or not frame <= sequences <= self.sequence_ceiling or sequences % frame:
+            raise ValueError("Batch must be frame-aligned within the initialized engine capacity")
+
+        async def update():
+            async with self.lock:
+                self._require_open()
+                if self.failed:
+                    raise RuntimeError("Cannot resize a failed extractor")
+                self.sequences_per_call = sequences
 
         return self._future(update()).result()
 
@@ -153,14 +173,13 @@ class VLLMExtractor(Extractor):
             self.actual_forward_batches.extend(receipt["actual_forward_batches"])
             self._fold_memory(receipt)
             if self.auto_batch_config is not None:
-                total = receipt.get("total_device_memory_bytes", 0)
-                peak = receipt.get("peak_device_memory_bytes", 0)
-                if total and peak > self.gpu_memory_utilization * total:
-                    frame = self.auto_batch_config.frame_sequences
-                    next_size = max(frame, (self.sequences_per_call - frame) // frame * frame)
-                    if next_size == self.sequences_per_call:
-                        raise MemoryError("One extraction archive frame exceeds the device memory target")
-                    self.sequences_per_call = next_size
+                self._phase_total = max(self._phase_total, receipt.get("total_device_memory_bytes", 0))
+                self._phase_driver = max(self._phase_driver, receipt.get("peak_device_memory_bytes", 0))
+                self._phase_reserved = max(self._phase_reserved, receipt.get("peak_gpu_reserved_bytes", 0))
+                self._phase_live = max(
+                    self._phase_live,
+                    receipt.get("peak_gpu_memory_bytes", 0) + self._phase_external,
+                )
         return ready
 
     async def _generate(self, tokens, ids):
@@ -194,6 +213,11 @@ class VLLMExtractor(Extractor):
     async def _stream_inner(self, token_batches, output_dir, emit):
         async with self.lock:
             call_sequences = self.sequences_per_call
+            self._phase_total = self._phase_driver = self._phase_reserved = self._phase_live = 0
+            self._phase_external = 0
+            if self.auto_batch_config is not None:
+                baseline = (await self.llm.collective_rpc("nh_memory_window"))[0]
+                self._phase_external = baseline["external_device_memory_bytes"]
             pending, completed = {}, {}
             next_yield = 0
             namespace = uuid.uuid4().hex
@@ -248,6 +272,29 @@ class VLLMExtractor(Extractor):
                     self.worker_rpc_seconds += time.perf_counter() - rpc_started
                     index += 1
             self.final_drain_seconds += await drain(0)
+            if self.auto_batch_config is not None:
+                target = self.gpu_memory_utilization * self._phase_total
+                pressure = bool(self._phase_total and max(self._phase_driver, self._phase_live) > target)
+                current_used = 0
+                if pressure:
+                    # Only unused allocator blocks are released; models stay resident.
+                    after = (await self.llm.collective_rpc("nh_memory_window", args=(True,)))[0]
+                    current_used = after["peak_device_memory_bytes"]
+                    frame = self.auto_batch_config.frame_sequences
+                    if call_sequences <= frame:
+                        if self._phase_live > target or current_used > target:
+                            raise MemoryError("One extraction archive frame exceeds the device memory target")
+                    else:
+                        # One reduction per drained call, based on the geometry
+                        # actually executed, never once per queued receipt.
+                        self.sequences_per_call = max(frame, call_sequences // 2 // frame * frame)
+                self.last_memory_window = dict(
+                    sequences=call_sequences, next_sequences=self.sequences_per_call,
+                    live_peak_bytes=self._phase_live, reserved_peak_bytes=self._phase_reserved,
+                    driver_peak_bytes=self._phase_driver, external_bytes=self._phase_external,
+                    total_bytes=self._phase_total, driver_after_trim_bytes=current_used,
+                    pressure=pressure,
+                )
 
     async def stream_to_disk(self, token_batches, output_dir):
         """Yield ordered durable shard receipts; two publications may overlap inference."""

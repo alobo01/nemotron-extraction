@@ -192,3 +192,17 @@ def test_active_site_reduction_waits_for_a_drained_boundary(worker, tmp_path):
     worker.nh_set_sites(["L0_resid_pre"])
     with pytest.raises(ValueError, match="subset"):
         worker.nh_set_sites(["wrong"])
+
+
+def test_memory_window_requires_drained_publications_and_resets_peaks(worker, monkeypatch):
+    calls=[]
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 10)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("trim"))
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: calls.append("reset"))
+    result=worker.nh_memory_window(True)
+    assert result["external_device_memory_bytes"]==10
+    assert calls==["trim","reset"]
+    worker.nh_active={"id":"busy"}
+    with pytest.raises(RuntimeError,match="Drain"):
+        worker.nh_memory_window()
+    worker.nh_active=None

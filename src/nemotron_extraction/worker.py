@@ -86,6 +86,20 @@ class ActivationHookExtension:
         torch.cuda.reset_peak_memory_stats()
         return self.nh_topology
 
+    def nh_memory_window(self, release_cached=False):
+        """Reset phase peaks only after captured tensors and writers have drained."""
+        if self.nh_active is not None or self.nh_pending:
+            raise RuntimeError("Drain publications before resetting memory statistics")
+        torch.cuda.synchronize()
+        if release_cached:
+            torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        snapshot = memory_peaks()
+        snapshot["external_device_memory_bytes"] = max(
+            0, snapshot["peak_device_memory_bytes"] - torch.cuda.memory_reserved()
+        )
+        return snapshot
+
     def nh_set_sites(self, keys):
         if self.nh_active is not None or self.nh_pending:
             raise RuntimeError("Drain publications before changing active sites")
