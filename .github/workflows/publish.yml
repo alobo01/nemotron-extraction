@@ -27,8 +27,8 @@ jobs:
           python-version: "3.12"
       - name: Lint and format check
         run: |
-          uvx ruff@0.9.4 check src benchmarks tests
-          uvx ruff@0.9.4 format --check src benchmarks tests
+          uvx ruff@0.9.4 check src benchmarks tests examples
+          uvx ruff@0.9.4 format --check src benchmarks tests examples
       - name: Run tests
         run: uv run --locked --group dev pytest -q
       - name: Verify release version
