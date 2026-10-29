@@ -129,8 +129,10 @@ def backend(args):
         model = AutoModelForCausalLM.from_pretrained(
             manifest["model_path"],
             torch_dtype=getattr(torch, args.dtype),
-            # "auto" offloads layers that do not fit, e.g. the float32 model on an 80 GB GPU.
+            # "auto" offloads layers that do not fit, e.g. the float32 model on an 80 GB GPU; the GPU
+            # cap leaves room for the float32 Mamba torch path, which allocates ~8 GB per 2048 tokens.
             device_map=args.hf_device_map,
+            **({"max_memory": {0: args.hf_max_gpu_memory, "cpu": "220GiB"}} if args.hf_max_gpu_memory else {}),
             trust_remote_code=True,
             local_files_only=True,
             **({"attn_implementation": args.attn_implementation} if args.attn_implementation else {}),
@@ -575,6 +577,7 @@ def main():
             child.add_argument("--precision", choices=PRECISIONS, default="native")
             child.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
             child.add_argument("--hf-device-map", default="cuda", help="HF placement; 'auto' offloads to CPU")
+            child.add_argument("--hf-max-gpu-memory", help="With --hf-device-map auto, e.g. 40GiB")
             child.add_argument("--reference", type=Path, help="Compare with this saved reference directory")
             child.add_argument("--write-reference", action="store_true", help="vLLM: save outputs as a reference")
             child.add_argument("--attn-implementation", help="HF attention implementation, e.g. flash_attention_2")
