@@ -57,23 +57,7 @@ METHODS = ("transformers", "package_baseline", "package_optimized", "sibling_fil
 
 
 class BaselineWorker(ActivationHookExtension):
-    """Add scheduler receipts to the frozen baseline without changing captures."""
-
-    def _nh_inputs(self, module, args, kwargs):
-        super()._nh_inputs(module, args, kwargs)
-        wave = self.nh_active
-        reverse = {v: k for k, v in wave["requests"].items()}
-        wave.setdefault("scheduler", []).extend(
-            dict(
-                request_id=reverse[i],
-                sequence_index=i,
-                start=start,
-                stop=stop,
-                computed_tokens=0,
-                prompt_length=wave["tokens"].shape[1],
-            )
-            for i, start, stop in self.nh_spans
-        )
+    """Keep scheduler receipts on the frozen baseline without changing captures."""
 
     @staticmethod
     def _nh_publish(wave):

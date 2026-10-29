@@ -40,7 +40,7 @@ def test_failed_device_check_prevents_any_publication(tmp_path):
     copied = Future()
     copied.set_result(0.0)
     wave = dict(
-        copies=[copied],
+        copies=[(copied, 1.0)],
         forward_events=[],
         origin_cpu=0,
         layout="per_site",

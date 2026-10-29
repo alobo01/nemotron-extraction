@@ -5,19 +5,22 @@ import tempfile
 import threading
 import time
 import uuid
-from pathlib import Path
 from dataclasses import asdict
 
 import torch
 from safetensors.torch import load_file
 
 from .extractor import Extractor
+from .precision import checkpoint_directory, validate_precision
 from .transport import SLOTS
 from .types import ActivationBatch, validate_tokens
 
+# Explicit Mamba cache types: the SSM state stays float32, the convolution state bfloat16.
+MATCHED_CACHE_DTYPES = dict(mamba_ssm_cache_dtype="float32", mamba_cache_dtype="bfloat16")
+
 
 class VLLMExtractor(Extractor):
-    """Persistent AsyncLLM workers with two in-flight capture/publication slots."""
+    """Persistent AsyncLLM workers with bounded in-flight capture/publication slots."""
 
     _worker_extension_cls = "nemotron_extraction.worker.ActivationHookExtension"
 
@@ -40,12 +43,26 @@ class VLLMExtractor(Extractor):
         auto_batch_config=None,
         publication_layout="monolithic",
         site_write_threads=8,
+        max_num_batched_tokens=None,
+        concurrent_waves=False,
+        capture_slots=SLOTS,
+        precision="native",
     ):
-        if publication_layout not in ("monolithic", "per_site") or not 1 <= site_write_threads <= 8:
-            raise ValueError("Invalid publication layout or site writer count")
-        self.publication_layout = publication_layout
-        self.site_write_threads = site_write_threads
-        super().__init__(sites, diagnostics, publication_threads)
+        """Waves are serialised unless ``concurrent_waves``; then up to ``capture_slots`` waves hold
+        buffers at once and the scheduler may mix their prompts in one forward. A token budget
+        below ``max_model_len`` needs ``enable_chunked_prefill``; prompts may then span forwards.
+        """
+        super().__init__(sites, diagnostics, publication_threads, publication_layout, site_write_threads)
+        self.precision = validate_precision(precision)
+        if type(capture_slots) is not int or capture_slots < 2:
+            raise ValueError("capture_slots must be an integer of at least 2")
+        if max_num_batched_tokens is not None and max_num_batched_tokens < 1:
+            raise ValueError("max_num_batched_tokens must be positive")
+        if max_num_batched_tokens is not None and max_num_batched_tokens < max_model_len and not enable_chunked_prefill:
+            raise ValueError("A token budget below max_model_len requires enable_chunked_prefill")
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.concurrent_waves, self.capture_slots = concurrent_waves, capture_slots
+        self.precision_receipt = None
         automatic = sequences_per_call == "auto"
         if (not automatic and sequences_per_call < 1) or max_model_len < 2 or not 0 < gpu_memory_utilization <= 1:
             raise ValueError("Invalid sequence batch size, model length or memory utilization")
@@ -76,11 +93,6 @@ class VLLMExtractor(Extractor):
         except BaseException:
             self.close()
             raise
-
-    def shard_path(self, output_dir, index):
-        if self.publication_layout == "per_site":
-            return Path(output_dir) / f"{index:06d}"
-        return super().shard_path(output_dir, index)
 
     def set_active_sites(self, sites):
         """Reduce captured publications at a drained boundary without reloading the model."""
@@ -133,10 +145,11 @@ class VLLMExtractor(Extractor):
             skip_tokenizer_init=True,
             max_model_len=self.max_model_len,
             max_num_seqs=self.sequences_per_call,
-            max_num_batched_tokens=self.sequences_per_call * self.max_model_len,
+            max_num_batched_tokens=self.max_num_batched_tokens or self.sequences_per_call * self.max_model_len,
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
             worker_extension_cls=self._worker_extension_cls,
+            **(MATCHED_CACHE_DTYPES if self.precision == "matched" else {}),
         )
         self.llm = AsyncLLM.from_engine_args(args)
         self.engine_startup_seconds = time.perf_counter() - started
@@ -152,9 +165,13 @@ class VLLMExtractor(Extractor):
                     self.publication_threads,
                     self.publication_layout,
                     self.site_write_threads,
+                    self.capture_slots,
                 ),
             )
         )[0]
+        if self.precision == "matched":
+            checkpoint = str(checkpoint_directory(model, revision))
+            self.precision_receipt = (await self.llm.collective_rpc("nh_match_precision", args=(checkpoint,)))[0]
         self.hook_install_seconds = time.perf_counter() - started
         self.installed = True
 
@@ -232,45 +249,77 @@ class VLLMExtractor(Extractor):
                     await emit(completed.pop(next_yield))
                     next_yield += 1
 
+            running = set()
+            generating = dict(waves=0, since=0.0)
+
+            def reap():
+                """Remove finished capture tasks and raise the first failure."""
+                for task in [task for task in running if task.done()]:
+                    running.discard(task)
+                    task.result()
+
             async def drain(limit):
-                """Poll until at most `limit` publications are pending; return seconds waited."""
+                """Poll until at most `limit` waves hold buffers; return seconds waited."""
                 started = time.perf_counter()
                 while len(pending) > limit:
+                    reap()
                     await collect()
                     if len(pending) > limit:
                         await asyncio.sleep(0.02)
                 return time.perf_counter() - started
 
-            index = 0
-            for batch in token_batches:
-                tokens = validate_tokens(batch)
-                if tokens.shape[1] + 1 > self.max_model_len:
-                    raise ValueError("Prompt plus one generated token exceeds max_model_len")
-                for chunk in tokens.split(call_sequences):
-                    if len(pending) >= SLOTS:
-                        self.backpressure_seconds += await drain(SLOTS - 1)
-                    path = self.shard_path(output_dir, index)
-                    if path.exists():
-                        raise FileExistsError(path)
-                    wave_id = f"{namespace}-{index}"
-                    ids = [f"{wave_id}-{row}" for row in range(len(chunk))]
-                    rpc_started = time.perf_counter()
-                    admitted = (
-                        await self.llm.collective_rpc(
-                            "nh_begin", args=(wave_id, ids, chunk.tolist(), str(path.resolve()))
-                        )
-                    )[0]
-                    self.worker_rpc_seconds += time.perf_counter() - rpc_started
-                    if not admitted:
-                        raise RuntimeError("Capture admission violated the two-slot bound")
-                    pending[wave_id] = index
-                    started = time.perf_counter()
+            async def capture(wave_id, chunk, ids):
+                # Generation time is wall time with at least one wave in flight.
+                if not generating["waves"]:
+                    generating["since"] = time.perf_counter()
+                generating["waves"] += 1
+                try:
                     await self._generate(chunk, ids)
-                    self.generate_seconds += time.perf_counter() - started
-                    rpc_started = time.perf_counter()
-                    await self.llm.collective_rpc("nh_seal", args=(wave_id,))
-                    self.worker_rpc_seconds += time.perf_counter() - rpc_started
-                    index += 1
+                finally:
+                    generating["waves"] -= 1
+                    if not generating["waves"]:
+                        self.generate_seconds += time.perf_counter() - generating["since"]
+                rpc_started = time.perf_counter()
+                await self.llm.collective_rpc("nh_seal", args=(wave_id,))
+                self.worker_rpc_seconds += time.perf_counter() - rpc_started
+
+            try:
+                index = 0
+                for batch in token_batches:
+                    tokens = validate_tokens(batch)
+                    if tokens.shape[1] + 1 > self.max_model_len:
+                        raise ValueError("Prompt plus one generated token exceeds max_model_len")
+                    for chunk in tokens.split(call_sequences):
+                        if len(pending) >= self.capture_slots:
+                            self.backpressure_seconds += await drain(self.capture_slots - 1)
+                        path = self.shard_path(output_dir, index)
+                        if path.exists():
+                            raise FileExistsError(path)
+                        wave_id = f"{namespace}-{index}"
+                        ids = [f"{wave_id}-{row}" for row in range(len(chunk))]
+                        rpc_started = time.perf_counter()
+                        admitted = (
+                            await self.llm.collective_rpc(
+                                "nh_begin", args=(wave_id, ids, chunk.tolist(), str(path.resolve()))
+                            )
+                        )[0]
+                        self.worker_rpc_seconds += time.perf_counter() - rpc_started
+                        if not admitted:
+                            raise RuntimeError("Capture admission violated the buffer-slot bound")
+                        pending[wave_id] = index
+                        if self.concurrent_waves:
+                            running.add(asyncio.create_task(capture(wave_id, chunk, ids)))
+                        else:
+                            await capture(wave_id, chunk, ids)
+                        index += 1
+                while running:
+                    await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+                    reap()
+            except BaseException:
+                for task in running:
+                    task.cancel()
+                await asyncio.gather(*running, return_exceptions=True)
+                raise
             self.final_drain_seconds += await drain(0)
             if self.auto_batch_config is not None:
                 target = self.gpu_memory_utilization * self._phase_total

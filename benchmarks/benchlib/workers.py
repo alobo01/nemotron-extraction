@@ -570,17 +570,16 @@ class IntegrityWorker(ActivationHookExtension):
         return result
 
     def _oracle(self, module, args, output):
-        wave = self.nh_active
-        if not self.nh_spans:
-            return
-        oracle = wave.setdefault("diagnostic_oracle", {})
-        length = wave["tokens"].shape[1]
-        for key, source in self.nh_captured.items():
-            host = oracle.setdefault(key, torch.empty((wave["tokens"].numel(), source.shape[-1]), dtype=source.dtype))
-            for index, start, stop in self.nh_spans:
-                host[index * length : (index + 1) * length].copy_(source[start:stop].detach().clone().cpu())
-        wave["diagnostic_slot"] = wave["slot"]
-        wave["diagnostic_occupied_slots"] = SLOTS - len(self.nh_pool.free)
+        for wave, row, offset, start, count in self.nh_spans:
+            oracle = wave.setdefault("diagnostic_oracle", {})
+            destination = row * wave["tokens"].shape[1] + offset
+            for key, source in self.nh_captured.items():
+                host = oracle.setdefault(
+                    key, torch.empty((wave["tokens"].numel(), source.shape[-1]), dtype=source.dtype)
+                )
+                host[destination : destination + count].copy_(source[start : start + count].detach().clone().cpu())
+            wave["diagnostic_slot"] = wave["slot"]
+            wave["diagnostic_occupied_slots"] = SLOTS - len(self.nh_pool.free)
 
     @staticmethod
     def _nh_publish(wave):

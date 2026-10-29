@@ -82,6 +82,27 @@ def forward(worker, request_ids, rows, computed=None):
     worker.model_runner.model(torch.tensor(rows).flatten(), torch.arange(length).repeat(len(rows)))
 
 
+def schedule(worker, entries):
+    """One forward over (request ID, full prompt, computed offset, scheduled count) entries."""
+    width = max(len(prompt) for _, prompt, _, _ in entries)
+    worker.model_runner.input_batch = SimpleNamespace(
+        req_ids=[rid for rid, *_ in entries],
+        token_ids_cpu=torch.tensor([prompt + [0] * (width - len(prompt)) for _, prompt, _, _ in entries]),
+        num_computed_tokens_cpu=[computed for _, _, computed, _ in entries],
+    )
+    counts = torch.tensor([count for *_, count in entries])
+    worker.model_runner.query_start_loc = SimpleNamespace(cpu=torch.cat([torch.zeros(1), counts.cumsum(0)]).long())
+    # Positions past the prompt stand in for generated tokens.
+    ids = [(prompt + [99] * count)[computed : computed + count] for _, prompt, computed, count in entries]
+    flat = torch.tensor(sum(ids, []))
+    worker.model_runner.model(flat, torch.arange(len(flat)))
+
+
+def resid_post(tokens):
+    # SplitBlock: hidden 2t plus residual 1 + t.
+    return [3 * t + 1 for t in tokens]
+
+
 def poll(worker):
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -120,12 +141,13 @@ def test_poll_does_not_wait_and_propagates_write_failure(worker):
     assert slot in worker.nh_pool.free
 
 
-def test_unknown_request_and_partial_prefill_are_rejected(worker, tmp_path):
+def test_unknown_request_and_out_of_order_span_are_rejected(worker, tmp_path):
     worker.nh_begin("wave", ["a"], [[1, 2]], str(tmp_path / "x.safetensors"))
     with pytest.raises(RuntimeError, match="Unknown request"):
         forward(worker, ["wrong"], [[1, 2]])
-    with pytest.raises(RuntimeError, match="partial prefill"):
+    with pytest.raises(RuntimeError, match="expected offset 0, got 1"):
         forward(worker, ["a"], [[1, 2]], computed=[1])
+    assert worker.nh_waves["wave"]["cursor"] == [0]
 
 
 def test_detailed_token_validation_is_opt_in_but_scheduler_checks_remain(worker, tmp_path):
@@ -133,7 +155,7 @@ def test_detailed_token_validation_is_opt_in_but_scheduler_checks_remain(worker,
     worker.nh_begin("tokens", ["a"], [[1, 2]], str(tmp_path / "tokens.safetensors"))
     with pytest.raises(RuntimeError, match="token IDs differ"):
         forward(worker, ["a"], [[2, 1]])
-    assert not worker.nh_active["covered"]
+    assert worker.nh_waves["tokens"]["cursor"] == [0]
 
 
 def test_detailed_token_validation_accepts_numpy_scheduler_tokens(worker, tmp_path):
@@ -144,7 +166,7 @@ def test_detailed_token_validation_accepts_numpy_scheduler_tokens(worker, tmp_pa
     )
     worker.model_runner.query_start_loc = SimpleNamespace(cpu=torch.tensor([0, 2]))
     worker.model_runner.model(torch.tensor([1, 2]), torch.tensor([0, 1]))
-    assert worker.nh_active["covered"] == {0}
+    assert worker.nh_waves["tokens"]["cursor"] == [2]
 
 
 def test_fast_path_does_not_read_per_token_cpu_content(worker, tmp_path):
@@ -202,7 +224,64 @@ def test_memory_window_requires_drained_publications_and_resets_peaks(worker, mo
     result=worker.nh_memory_window(True)
     assert result["external_device_memory_bytes"]==10
     assert calls==["trim","reset"]
-    worker.nh_active={"id":"busy"}
+    worker.nh_waves={"busy":{}}
     with pytest.raises(RuntimeError,match="Drain"):
         worker.nh_memory_window()
-    worker.nh_active=None
+    worker.nh_waves={}
+
+
+def test_one_prompt_split_into_three_chunks_keeps_row_order(worker, tmp_path):
+    prompt = [5, 6, 7, 8, 9, 10]
+    worker.nh_begin("chunks", ["a"], [prompt], str(tmp_path / "chunks.safetensors"))
+    for computed, count in [(0, 2), (2, 3), (5, 1)]:
+        schedule(worker, [("a-0123abcd", prompt, computed, count)])
+    worker.nh_seal("chunks")
+    receipt = poll(worker)[0]
+    assert load_file(receipt["path"])["L0_resid_post"].flatten().tolist() == resid_post(prompt)
+    assert receipt["actual_forward_batches"] == [1, 1, 1]
+    assert [s["computed_tokens"] for s in receipt["scheduler"]] == [0, 2, 5]
+
+
+def test_interleaved_requests_and_generated_tokens_are_attributed(worker, tmp_path):
+    rows = [[1, 2, 3, 4], [1, 2, 3, 4], [7, 8, 9, 10]]
+    worker.nh_begin("mixed", ["a", "b", "c"], rows, str(tmp_path / "mixed.safetensors"))
+    schedule(worker, [("c", rows[2], 0, 3), ("a", rows[0], 0, 4), ("b", rows[1], 0, 1)])
+    # a now decodes a generated token; it shares the forward with the remaining prompt chunks.
+    schedule(worker, [("b", rows[1], 1, 3), ("a", rows[0], 4, 1), ("c", rows[2], 3, 1)])
+    worker.nh_seal("mixed")
+    saved = load_file(poll(worker)[0]["path"])
+    assert saved["L0_resid_post"].flatten().tolist() == sum((resid_post(row) for row in rows), [])
+    assert torch.equal(saved["token_ids"], torch.tensor(rows))
+
+
+def test_repeated_or_missing_spans_never_publish(worker, tmp_path):
+    prompt = [1, 2, 3]
+    worker.nh_begin("gap", ["a"], [prompt], str(tmp_path / "gap.safetensors"))
+    schedule(worker, [("a", prompt, 0, 2)])
+    with pytest.raises(RuntimeError, match="expected offset 2, got 0"):
+        schedule(worker, [("a", prompt, 0, 2)])  # preemption would recompute from zero
+    with pytest.raises(RuntimeError, match="Missing prompt activations"):
+        worker.nh_seal("gap")
+    assert not list(tmp_path.iterdir()) and not worker.nh_pending
+
+
+def test_two_waves_sharing_forwards_route_rows_to_their_own_buffers(worker, tmp_path):
+    worker.nh_publication_layout = "per_site"
+    first, second = [[1, 2, 3]], [[4, 5], [6, 7]]
+    assert worker.nh_begin("w1", ["w1-0"], first, str(tmp_path / "w1"))
+    assert worker.nh_begin("w2", ["w2-0", "w2-1"], second, str(tmp_path / "w2"))
+    assert not worker.nh_begin("w3", ["w3-0"], [[1]], str(tmp_path / "w3"))  # both slots are owned
+    with pytest.raises(ValueError, match="open capture wave"):
+        worker.nh_begin("w4", ["w1-0"], [[1]], str(tmp_path / "w4"))
+    schedule(worker, [("w1-0", first[0], 0, 2), ("w2-1", second[1], 0, 2)])
+    schedule(worker, [("w2-0", second[0], 0, 2), ("w1-0", first[0], 2, 1)])
+    worker.nh_seal("w2")
+    worker.nh_seal("w1")
+    receipts = {r["wave_id"]: r for r in poll(worker) + (poll(worker) if len(worker.nh_pending) else [])}
+    for wave_id, rows in (("w1", first), ("w2", second)):
+        record = receipts[wave_id]["files"]["L0_resid_post"]
+        assert load_file(record["path"])["L0_resid_post"].flatten().tolist() == sum(map(resid_post, rows), [])
+    assert receipts["w1"]["actual_forward_batches"] == [1, 1]
+    # Forward time is split by rows: w1 had 2 of 4 rows, then 1 of 3.
+    assert receipts["w1"]["worker_forward_seconds"] == pytest.approx(0.001 * (2 / 4 + 1 / 3))
+    assert sorted(worker.nh_pool.free) == [0, 1] and not worker.nh_requests

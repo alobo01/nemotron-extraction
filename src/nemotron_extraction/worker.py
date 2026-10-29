@@ -7,10 +7,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
-from .hooks import install
+from .hooks import install, layers_of
+from .precision import fp32_router, ieee_settings, precision_settings, set_precision
 from .transport import (
+    SLOTS,
     BufferPool,
     capture_seconds,
+    device_finite,
     finish_copy,
     memory_peaks,
     publish,
@@ -25,7 +28,7 @@ def external_request_id(rid, known):
     """Map a scheduler request ID back to the caller's ID."""
     if rid in known:
         return rid
-    # vLLM 0.20.1 appends an eight-character internal uniqueness suffix.
+    # vLLM 0.20.1 through 0.27.1 append an eight-character internal uniqueness suffix.
     external, separator, suffix = rid.rpartition("-")
     if not separator or len(suffix) != 8 or external not in known:
         raise RuntimeError(f"Unknown request ID {rid}")
@@ -41,6 +44,7 @@ class ActivationHookExtension:
         publication_threads=1,
         publication_layout="monolithic",
         site_write_threads=8,
+        capture_slots=SLOTS,
     ):
         validate_publication_threads(publication_threads)
         if publication_layout not in ("monolithic", "per_site") or not 1 <= site_write_threads <= 8:
@@ -50,8 +54,11 @@ class ActivationHookExtension:
         self.nh_diagnostics = diagnostics
         self.nh_captured = {}
         self.nh_capture_events = []
-        self.nh_pool = BufferPool()
-        self.nh_active = None
+        self.nh_pool = BufferPool(capture_slots)
+        # Open capture waves and the scheduler request IDs that route rows into them.
+        self.nh_waves = {}
+        self.nh_requests = {}
+        self.nh_spans = []
         self.nh_pending = {}
         self.nh_copy = ThreadPoolExecutor(max_workers=1)
         self.nh_writer = ThreadPoolExecutor(max_workers=publication_threads)
@@ -86,9 +93,16 @@ class ActivationHookExtension:
         torch.cuda.reset_peak_memory_stats()
         return self.nh_topology
 
+    def nh_match_precision(self, checkpoint_dir):
+        """IEEE float32 matmuls and a float32 router, as in the PyTorch reference."""
+        set_precision(ieee_settings())
+        _, layers = layers_of(self.model_runner.model)
+        self.nh_router_forwards = fp32_router(layers, checkpoint_dir)
+        return dict(settings=precision_settings(), fp32_router_layers=sorted(self.nh_router_forwards))
+
     def nh_memory_window(self, release_cached=False):
         """Reset phase peaks only after captured tensors and writers have drained."""
-        if self.nh_active is not None or self.nh_pending:
+        if self.nh_waves or self.nh_pending:
             raise RuntimeError("Drain publications before resetting memory statistics")
         torch.cuda.synchronize()
         if release_cached:
@@ -101,7 +115,7 @@ class ActivationHookExtension:
         return snapshot
 
     def nh_set_sites(self, keys):
-        if self.nh_active is not None or self.nh_pending:
+        if self.nh_waves or self.nh_pending:
             raise RuntimeError("Drain publications before changing active sites")
         if not keys or len(set(keys)) != len(keys) or not set(keys) <= set(self.nh_keys):
             raise ValueError("Active sites must be a nonempty subset of installed hooks")
@@ -109,8 +123,10 @@ class ActivationHookExtension:
         return True
 
     def nh_begin(self, wave_id, request_ids, token_ids, path):
-        if self.nh_active is not None or wave_id in self.nh_pending:
+        if wave_id in self.nh_waves or wave_id in self.nh_pending:
             raise RuntimeError("Capture wave already active")
+        if any(rid in self.nh_requests for rid in request_ids):
+            raise ValueError("Request ID already belongs to an open capture wave")
         slot = self.nh_pool.acquire()
         if slot is None:
             return False
@@ -118,7 +134,7 @@ class ActivationHookExtension:
         if len(request_ids) != len(tokens) or len(set(request_ids)) != len(request_ids):
             self.nh_pool.release(slot)
             raise ValueError("Each prompt requires a unique request ID")
-        self.nh_active = {
+        wave = {
             "id": wave_id,
             "slot": slot,
             "tokens": tokens,
@@ -130,7 +146,8 @@ class ActivationHookExtension:
             "layout": self.nh_publication_layout,
             "keys": list(self.nh_enabled_keys),
             "site_writer": self.nh_site_writer,
-            "covered": set(),
+            # Next prompt offset per row: spans must arrive contiguous and in order.
+            "cursor": [0] * len(tokens),
             "forward_events": [],
             "forward_batches": [],
             "copy_events": [],
@@ -141,109 +158,135 @@ class ActivationHookExtension:
             "origin_cpu": self.nh_origin_cpu,
             "memory": {},
         }
+        self.nh_waves[wave_id] = wave
+        self.nh_requests.update((rid, (wave, row)) for rid, row in wave["requests"].items())
         return True
 
     def _nh_inputs(self, module, args, kwargs):
-        if self.nh_active is None:
+        if not self.nh_waves:
             raise RuntimeError("Inference submitted without a capture reservation")
-        wave = self.nh_active
         runner = self.model_runner
         batch = runner.input_batch
         ids = list(batch.req_ids)
         # CPU scheduler metadata: no CUDA synchronization or token-content matching.
         starts = runner.query_start_loc.cpu[: len(ids) + 1].tolist()
         spans = []
-        length = wave["tokens"].shape[1]
         for index, rid in enumerate(ids):
+            rid = external_request_id(rid, self.nh_requests)
+            wave, row = self.nh_requests[rid]
             computed = int(batch.num_computed_tokens_cpu[index])
-            rid = external_request_id(rid, wave["requests"])
-            prompt_index = wave["requests"][rid]
+            length = wave["tokens"].shape[1]
             start, end = int(starts[index]), int(starts[index + 1])
             if computed >= length:
-                continue
-            if computed != 0 or end - start != length:
-                raise RuntimeError("Requires whole-prefill prompts; partial prefill is unsupported")
-            if prompt_index in wave["covered"]:
-                raise RuntimeError("Prompt captured twice")
+                continue  # generated tokens are never captured
+            if computed != wave["cursor"][row]:
+                expected = wave["cursor"][row]
+                raise RuntimeError(f"Prompt span out of order for {rid}: expected offset {expected}, got {computed}")
+            count = min(end - start, length - computed)
             if self.nh_diagnostics:
-                token_ids = batch.token_ids_cpu[index, :length]
-                if token_ids.tolist() != wave["tokens"][prompt_index].tolist():
+                token_ids = batch.token_ids_cpu[index, computed : computed + count]
+                if token_ids.tolist() != wave["tokens"][row, computed : computed + count].tolist():
                     raise RuntimeError("Worker input token IDs differ from submitted prompt")
-            spans.append((prompt_index, start, end))
+            spans.append((wave, row, computed, start, count, rid))
+        # Commit only after every request in this forward was accepted.
+        for wave, row, computed, start, count, rid in spans:
+            wave["cursor"][row] = computed + count
             wave["scheduler"].append(
                 dict(
                     request_id=rid,
-                    sequence_index=prompt_index,
+                    sequence_index=row,
                     start=start,
-                    stop=end,
+                    stop=start + count,
                     computed_tokens=computed,
-                    prompt_length=length,
+                    prompt_length=wave["tokens"].shape[1],
                 )
             )
-            wave["covered"].add(prompt_index)
-        self.nh_spans = spans
+        self.nh_spans = [span[:5] for span in spans]
         self.nh_forward_start = torch.cuda.Event(enable_timing=True)
         self.nh_forward_start.record()
 
     def _nh_end(self, module, args, output):
-        wave = self.nh_active
         end_forward = torch.cuda.Event(enable_timing=True)
         end_forward.record()
-        wave["forward_events"].append((self.nh_forward_start, end_forward))
-        wave["forward_batches"].append(len(self.nh_spans))
         captured = dict(self.nh_captured)
         self.nh_captured.clear()
-        wave["capture_events"].extend(self.nh_capture_events)
+        capture_events = list(self.nh_capture_events)
         self.nh_capture_events.clear()
         if set(captured) != set(self.nh_keys):
             raise RuntimeError("Captured site set differs from requested sites")
-        captured = {key: captured[key] for key in wave["keys"]}
+        if not self.nh_spans:
+            return
+        captured = {key: captured[key] for key in self.nh_enabled_keys}
+        # Waves sharing one forward split its forward and copy time in proportion to their rows.
+        rows = {}
+        for wave, _, _, _, count in self.nh_spans:
+            rows[wave["id"]] = rows.get(wave["id"], 0) + count
+        total = sum(rows.values())
+        waves = {wave["id"]: wave for wave, *_ in self.nh_spans}
+        copy, events = self._nh_transfer(captured, waves)
+        for wave_id, wave in waves.items():
+            share = rows[wave_id] / total
+            wave["forward_events"].append((self.nh_forward_start, end_forward, share))
+            wave["forward_batches"].append(sum(1 for span in self.nh_spans if span[0] is wave))
+            wave["copies"].append((copy, share))
+            wave["copy_events"].append(events)
+            wave["capture_events"].extend(capture_events)
+            if self.nh_diagnostics:
+                wave["memory"] = memory_peaks(wave["memory"])
+        self.nh_spans = []
+
+    def _nh_transfer(self, captured, waves):
+        """Copy this forward's spans into each wave's pinned buffers; return the copy future and events."""
+        last = max(start + count for _, _, _, start, count in self.nh_spans)
         stream = torch.cuda.current_stream()
         started, ended = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-        total_rows = wave["tokens"].numel()
-        length = wave["tokens"].shape[1]
         with torch.cuda.stream(self.nh_stream):
             self.nh_stream.wait_stream(stream)
             started.record()
             for key, source in captured.items():
-                if source.ndim != 2 or any(stop > source.shape[0] for _, _, stop in self.nh_spans):
+                if source.ndim != 2 or last > source.shape[0]:
                     raise RuntimeError(f"{key}: capture shape does not cover scheduler spans")
-                if wave["layout"] == "per_site":
-                    finite = torch.stack([torch.isfinite(chunk).all() for chunk in source.split(8192)]).all()
-                    flag = self.nh_pool.tensor(
-                        wave["slot"], key + "_finite_" + str(len(wave["finite_flags"])), (), torch.bool, pinned=True
-                    )
-                    flag.copy_(finite, non_blocking=True)
-                    # A wave may contain several forwards; keep each result independently.
-                    wave["finite_flags"].append((key, flag))
-                host = self.nh_pool.tensor(wave["slot"], key, (total_rows, source.shape[-1]), source.dtype, pinned=True)
-                wave["tensors"][key] = host
                 self.nh_topology[key]["width"] = source.shape[-1]
-                for index, start, stop in self.nh_spans:
-                    host[index * length : (index + 1) * length].copy_(source[start:stop], non_blocking=True)
+                finite = device_finite(source[:last]) if self.nh_publication_layout == "per_site" else None
+                for wave in waves.values():
+                    if finite is not None:
+                        flag = self.nh_pool.tensor(
+                            wave["slot"], key + "_finite_" + str(len(wave["finite_flags"])), (), torch.bool, pinned=True
+                        )
+                        flag.copy_(finite, non_blocking=True)
+                        # A wave may contain several forwards; keep each result independently.
+                        wave["finite_flags"].append((key, flag))
+                    wave["tensors"][key] = self.nh_pool.tensor(
+                        wave["slot"], key, (wave["tokens"].numel(), source.shape[-1]), source.dtype, pinned=True
+                    )
+                for wave, row, offset, start, count in self.nh_spans:
+                    destination = row * wave["tokens"].shape[1] + offset
+                    wave["tensors"][key][destination : destination + count].copy_(
+                        source[start : start + count], non_blocking=True
+                    )
                 source.record_stream(self.nh_stream)
             ended.record()
-        wave["copies"].append(self.nh_copy.submit(finish_copy, started, ended, captured))
-        wave["copy_events"].append((started, ended))
-        if self.nh_diagnostics:
-            wave["memory"] = memory_peaks(wave["memory"])
+        return self.nh_copy.submit(finish_copy, started, ended, captured), (started, ended)
 
     def nh_seal(self, wave_id):
-        wave = self.nh_active
-        if wave is None or wave["id"] != wave_id:
+        wave = self.nh_waves.get(wave_id)
+        if wave is None:
             raise RuntimeError("Unknown capture wave")
-        if len(wave["covered"]) != len(wave["tokens"]):
+        length = wave["tokens"].shape[1]
+        if any(position != length for position in wave["cursor"]):
             raise RuntimeError("Missing prompt activations")
+        del self.nh_waves[wave_id]
+        for rid in wave["requests"]:
+            del self.nh_requests[rid]
         wave["memory"] = memory_peaks(wave["memory"])
         wave["topology"] = {key: dict(value) for key, value in self.nh_topology.items()}
         self.nh_pending[wave_id] = (wave["slot"], self.nh_writer.submit(self._nh_publish, wave))
-        self.nh_active = None
         return True
 
     @staticmethod
     def _nh_publish(wave):
-        copy_seconds = sum(copy.result() for copy in wave["copies"])
-        forward_seconds = sum(seconds(start, end) for start, end in wave["forward_events"])
+        copy_seconds = sum(copy.result() * share for copy, share in wave["copies"])
+        forward_seconds = sum(seconds(start, end) * share for start, end, share in wave["forward_events"])
         write_start = time.perf_counter() - wave["origin_cpu"]
         if wave.get("layout") == "per_site":
             for key, flag in wave["finite_flags"]:
@@ -267,7 +310,8 @@ class ActivationHookExtension:
             diagnostics=wave["diagnostics"],
         )
         receipt["timeline"] = timeline(
-            wave["origin"], (("forward", wave["forward_events"]), ("D2H", wave["copy_events"]))
+            wave["origin"],
+            (("forward", [(start, end) for start, end, _ in wave["forward_events"]]), ("D2H", wave["copy_events"])),
         )
         receipt["timeline"].append(
             {"name": "write", "start": write_start, "end": time.perf_counter() - wave["origin_cpu"]}
@@ -296,8 +340,13 @@ class ActivationHookExtension:
         finally:
             for handle in self.nh_handles:
                 handle.remove()
+            if getattr(self, "nh_router_forwards", None):
+                _, layers = layers_of(self.model_runner.model)
+                for number, forward in self.nh_router_forwards.items():
+                    layers[number].mixer.gate.forward = forward
             self.nh_handles.clear()
             self.nh_captured.clear()
-            self.nh_active = None
+            self.nh_waves.clear()
+            self.nh_requests.clear()
             self.nh_pending.clear()
             self.nh_pool.reset()
