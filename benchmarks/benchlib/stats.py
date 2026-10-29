@@ -27,7 +27,8 @@ class Agreement:
         self.cosines, self.error2, self.reference2, self.max_error = [], 0.0, 0.0, 0.0
 
     def add(self, reference, candidate):
-        if reference.shape != candidate.shape or reference.dtype != candidate.dtype:
+        # A float32 reference may judge a lower-precision candidate; otherwise dtypes must match.
+        if reference.shape != candidate.shape or reference.dtype not in (candidate.dtype, torch.float32):
             raise ValueError("Activation shapes or dtypes differ")
         for left, right in zip(reference.split(256), candidate.split(256)):
             left, right = left.float(), right.float()

@@ -41,6 +41,7 @@ from safetensors.torch import load_file, save_file
 
 from nemotron_extraction import HFExtractor, HookSite, VLLMExtractor
 from nemotron_extraction.hooks import representative_sites
+from nemotron_extraction.precision import PRECISIONS, precision_settings
 
 TOKENS_PER_LANGUAGE = 1_000_000
 BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128)
@@ -114,9 +115,12 @@ def backend(args):
         raise ValueError("Invalid token range")
     tokens = all_tokens[args.start : stop]
     run = args.output
-    reference_dir = run / "reference"
+    # A run writes the reference (HF by default, vLLM with --write-reference) or compares with one.
+    writes = args.write_reference or (args.backend == "hf" and args.reference is None)
+    reference_dir = args.reference or run / "reference"
     reference_dir.mkdir(parents=True, exist_ok=True)
-    sites_file = run / "sites.json"
+    run.mkdir(parents=True, exist_ok=True)
+    sites_file = reference_dir.parent / "sites.json"
     started = time.perf_counter()
     if args.backend == "hf":
         from transformers import AutoModelForCausalLM
@@ -124,27 +128,36 @@ def backend(args):
         phase = time.perf_counter()
         model = AutoModelForCausalLM.from_pretrained(
             manifest["model_path"],
-            torch_dtype=torch.bfloat16,
-            device_map="cuda",
+            torch_dtype=getattr(torch, args.dtype),
+            # "auto" offloads layers that do not fit, e.g. the float32 model on an 80 GB GPU.
+            device_map=args.hf_device_map,
             trust_remote_code=True,
             local_files_only=True,
+            **({"attn_implementation": args.attn_implementation} if args.attn_implementation else {}),
         )
         model_load_seconds = time.perf_counter() - phase
         phase = time.perf_counter()
         sites = representative_sites(model)
-        extractor = HFExtractor(model, sites)
+        extractor = HFExtractor(model, sites, precision=args.precision)
         hook_install_seconds = time.perf_counter() - phase
-        write_json(sites_file, [{"layer": site.layer, "kind": site.kind} for site in sites])
+        if writes:
+            write_json(sites_file, [{"layer": site.layer, "kind": site.kind} for site in sites])
     else:
         sites = [HookSite(**site) for site in json.loads(sites_file.read_text())]
         extractor = VLLMExtractor(
             manifest["model_path"],
             sites,
-            sequences_per_call=args.batch_size,
+            sequences_per_call=args.sequences_per_call or args.batch_size,
             max_model_len=2049,
             sink_dir=os.environ.get("NH_SINK_DIR"),
             gpu_memory_utilization=float(os.environ.get("NH_GPU_MEMORY_UTILIZATION", "0.96")),
             kv_cache_memory_bytes=None,
+            enable_chunked_prefill=args.max_num_batched_tokens is not None,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            concurrent_waves=args.concurrent_waves,
+            capture_slots=args.capture_slots,
+            precision=args.precision,
+            dtype=args.dtype,
         )
         model_load_seconds = extractor.engine_startup_seconds
         hook_install_seconds = extractor.hook_install_seconds
@@ -182,7 +195,7 @@ def backend(args):
                 raise ValueError("Extractor changed input token order")
             shard = reference_dir / f"{index:06d}.safetensors"
             begin = time.perf_counter()
-            if args.backend == "hf":
+            if writes:
                 save_file({"token_ids": batch, **result.activations}, str(shard))
                 persistence += time.perf_counter() - begin
             else:
@@ -246,6 +259,18 @@ def backend(args):
         "gpu_memory_utilization": (extractor.gpu_memory_utilization if args.backend == "vllm" else None),
         "kv_cache_memory_bytes": (extractor.kv_cache_memory_bytes if args.backend == "vllm" else None),
         "cuda_graphs_enabled": False,
+        "precision": args.precision,
+        "dtype": args.dtype,
+        "precision_settings": precision_settings(),
+        "vllm_router": getattr(extractor, "precision_receipt", None),
+        "attn_implementation": args.attn_implementation,
+        "reference": str(reference_dir),
+        "scheduling": dict(
+            sequences_per_call=args.sequences_per_call or args.batch_size,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            concurrent_waves=args.concurrent_waves,
+            capture_slots=args.capture_slots,
+        ),
         "gpu": torch.cuda.get_device_name(),
         "source": {
             "model": manifest["model"],
@@ -257,13 +282,13 @@ def backend(args):
         "manifest_sha256": sha256(args.work / "manifest.json"),
         "script_sha256": sha256(__file__),
     }
-    if args.backend == "vllm":
+    if not writes:
         receipt["agreement"] = {key: value.result() for key, value in stats.items()}
         receipt["passed"] = all(value["passed"] for value in receipt["agreement"].values())
         save_file({key: torch.cat(value.cosines) for key, value in stats.items()}, str(run / "cosines.safetensors"))
     write_json(run / f"{args.backend}.json", receipt)
-    # Delete only this run's raw baseline after durable comparison metrics exist.
-    if args.backend == "vllm":
+    # Delete only this run's own raw baseline after durable comparison metrics exist.
+    if not writes and args.reference is None:
         for shard in reference_dir.glob("*.safetensors"):
             shard.unlink()
     print(json.dumps({k: receipt[k] for k in ("backend", "tokens", "tokens_per_second")}), flush=True)
@@ -547,6 +572,16 @@ def main():
         child.add_argument("--batch-size", type=int, choices=BATCH_SIZES, default=4)
         if command == "backend":
             child.add_argument("--backend", choices=("hf", "vllm"), required=True)
+            child.add_argument("--precision", choices=PRECISIONS, default="native")
+            child.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
+            child.add_argument("--hf-device-map", default="cuda", help="HF placement; 'auto' offloads to CPU")
+            child.add_argument("--reference", type=Path, help="Compare with this saved reference directory")
+            child.add_argument("--write-reference", action="store_true", help="vLLM: save outputs as a reference")
+            child.add_argument("--attn-implementation", help="HF attention implementation, e.g. flash_attention_2")
+            child.add_argument("--sequences-per-call", type=int, help="vLLM wave size; default --batch-size")
+            child.add_argument("--max-num-batched-tokens", type=int, help="vLLM token budget; enables chunking")
+            child.add_argument("--concurrent-waves", action="store_true")
+            child.add_argument("--capture-slots", type=int, default=2)
         else:
             child.add_argument("--hf-python", help="Existing compatible HF environment, if different from vLLM")
     planning = sub.add_parser("plan", help="Print job ranges from <pilot>/<lang>-0 receipts; submits nothing")
