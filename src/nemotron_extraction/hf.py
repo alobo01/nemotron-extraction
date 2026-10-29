@@ -14,7 +14,18 @@ from torch import nn
 
 from .extractor import Extractor
 from .hooks import decoder_of, install, repair_time_step_limits
-from .transport import SLOTS, BufferPool, capture_seconds, finish_copy, memory_peaks, publish, timeline
+from .precision import ieee_settings, set_precision, validate_precision
+from .transport import (
+    SLOTS,
+    BufferPool,
+    capture_seconds,
+    device_finite,
+    finish_copy,
+    memory_peaks,
+    publish,
+    publish_site_directory,
+    timeline,
+)
 from .types import ActivationBatch, DeviceActivationBatch, validate_tokens
 
 
@@ -29,6 +40,7 @@ class Capture(NamedTuple):
     forward_events: object
     copy_events: object
     capture_events: tuple
+    finite: dict
 
 
 class HFExtractor(Extractor):
@@ -46,8 +58,16 @@ class HFExtractor(Extractor):
         local_files_only=False,
         diagnostics=False,
         publication_threads=1,
+        publication_layout="monolithic",
+        site_write_threads=8,
+        precision="native",
+        attn_implementation=None,
     ):
-        super().__init__(sites, diagnostics, publication_threads)
+        super().__init__(sites, diagnostics, publication_threads, publication_layout, site_write_threads)
+        # "matched" sets process-wide IEEE float32 matmuls; the reference router is already float32.
+        self.precision = validate_precision(precision)
+        if precision == "matched":
+            set_precision(ieee_settings())
         self.owns_model = not isinstance(model, nn.Module)
         started = time.perf_counter()
         if self.owns_model:
@@ -60,6 +80,7 @@ class HFExtractor(Extractor):
                 device_map=device,
                 trust_remote_code=trust_remote_code,
                 local_files_only=local_files_only,
+                **({"attn_implementation": attn_implementation} if attn_implementation else {}),
             )
         repair_time_step_limits(model)
         self.model_load_seconds = time.perf_counter() - started
@@ -72,6 +93,7 @@ class HFExtractor(Extractor):
         self.pool = BufferPool()
         self.producer = ThreadPoolExecutor(max_workers=1)
         self.writer = ThreadPoolExecutor(max_workers=publication_threads)
+        self.site_writer = ThreadPoolExecutor(max_workers=site_write_threads)
         self.metrics_lock = threading.Lock()
         self.copy_worker = ThreadPoolExecutor(max_workers=1)
         self.capture_lock = threading.Lock()
@@ -165,12 +187,16 @@ class HFExtractor(Extractor):
                     self.model_forward_seconds += time.perf_counter() - started
             values = {"token_ids": tokens}
             sources = dict(self.captured)
+            pinned = self.copy_stream is not None
+            finite = {}
             for site in self.sites:
                 value = sources[site.key]
                 values[site.key] = self.pool.tensor(
-                    slot, site.key, (tokens.numel(), value.shape[-1]), value.dtype, pinned=self.copy_stream is not None
+                    slot, site.key, (tokens.numel(), value.shape[-1]), value.dtype, pinned=pinned
                 )
                 self.topology[site.key]["width"] = value.shape[-1]
+                if self.publication_layout == "per_site":
+                    finite[site.key] = self.pool.tensor(slot, site.key + "_finite", (), torch.bool, pinned=pinned)
             if self.copy_stream is not None:
                 copy_start, copy_end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
                 with torch.cuda.stream(self.copy_stream):
@@ -178,6 +204,8 @@ class HFExtractor(Extractor):
                     self.copy_stream.wait_event(events[1])
                     copy_start.record()
                     for key, source in sources.items():
+                        if key in finite:
+                            finite[key].copy_(device_finite(source), non_blocking=True)
                         values[key].copy_(source.reshape(values[key].shape), non_blocking=True)
                         source.record_stream(self.copy_stream)
                     copy_end.record()
@@ -186,10 +214,12 @@ class HFExtractor(Extractor):
                 self._fold_memory(memory_peaks(device=self.device))
             else:
                 for key, source in sources.items():
+                    if key in finite:
+                        finite[key].copy_(device_finite(source))
                     values[key].copy_(source.reshape(values[key].shape))
                 copied = self.copy_worker.submit(finish_copy, None, None, sources)
             self.actual_forward_batches.append(len(tokens))
-            return Capture(values, copied, events, copy_events, tuple(self.capture_events))
+            return Capture(values, copied, events, copy_events, tuple(self.capture_events), finite)
 
     def _finish(self, capture):
         seconds = capture.copied.result()
@@ -203,7 +233,13 @@ class HFExtractor(Extractor):
         try:
             self._finish(capture)
             write_start = time.perf_counter() - self.origin_cpu
-            receipt = publish(capture.values, path)
+            if self.publication_layout == "per_site":
+                for key, flag in capture.finite.items():
+                    if not bool(flag):
+                        raise ValueError(f"{key}: nonfinite activations")
+                receipt = publish_site_directory(capture.values, path, self.site_writer)
+            else:
+                receipt = publish(capture.values, path)
             with self.metrics_lock:
                 self.worker_write_seconds += receipt["write_seconds"]
                 self.validation_seconds += receipt["validation_seconds"]
@@ -286,6 +322,7 @@ class HFExtractor(Extractor):
         self.producer.shutdown(wait=True)
         self.copy_worker.shutdown(wait=True)
         self.writer.shutdown(wait=True)
+        self.site_writer.shutdown(wait=True)
         self.pool.reset()
         for handle in self.handles:
             handle.remove()

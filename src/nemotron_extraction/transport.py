@@ -22,16 +22,18 @@ MEMORY_KEYS = (
     "total_device_memory_bytes",
     "peak_device_memory_fraction",
 )
-# One capture being filled while the previous one is written.
+# By default one capture is filled while the previous one is written.
 SLOTS = 2
 
 
 class BufferPool:
     """Release a slot only after its consumer finishes."""
 
-    def __init__(self):
-        self.slots = [{} for _ in range(SLOTS)]
-        self.free = list(range(SLOTS))
+    def __init__(self, slots=SLOTS):
+        if type(slots) is not int or slots < 2:
+            raise ValueError("A buffer pool needs at least two slots")
+        self.slots = [{} for _ in range(slots)]
+        self.free = list(range(slots))
         self.lock = threading.Lock()
 
     def acquire(self):
@@ -55,7 +57,7 @@ class BufferPool:
     def reset(self):
         """Only call once transfers and writers have drained; no slot can still be read."""
         with self.lock:
-            self.free = list(range(SLOTS))
+            self.free = list(range(len(self.slots)))
             for slot in self.slots:
                 slot.clear()
 
@@ -107,15 +109,38 @@ def memory_peaks(previous=None, device=None):
     return {key: max(value, previous.get(key, 0)) for key, value in current.items()}
 
 
+def fsync_file(path):
+    with open(path, "r+b") as handle:
+        os.fsync(handle.fileno())
+
+
+def fsync_directory(path):
+    """Persist directory entries; Windows has no directory handles to sync."""
+    if os.name == "nt":
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def device_finite(source):
+    """One device-side flag; chunks bound the temporary boolean tensor."""
+    return torch.stack([torch.isfinite(chunk).all() for chunk in source.split(8192)]).all()
+
+
 @contextmanager
 def atomic_path(path):
-    """Yield a temporary sibling path that replaces ``path`` only if the block succeeds."""
+    """Yield a temporary sibling path that durably replaces ``path`` only if the block succeeds."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_suffix(path.suffix + ".partial")
     try:
         yield partial
+        fsync_file(partial)
         partial.replace(path)
+        fsync_directory(path.parent)
     except BaseException:
         partial.unlink(missing_ok=True)
         raise
@@ -167,8 +192,7 @@ def publish_site_directory(tensors, path, writer, metadata=None):
         file = partial / (key + ".safetensors")
         digest = tensor_sha256(tensor)
         save_file({key: tensor}, str(file), metadata=metadata)
-        with file.open("r+b") as handle:
-            os.fsync(handle.fileno())
+        fsync_file(file)
         return key, dict(
             path=str(path / file.name),
             sha256=digest,
@@ -196,19 +220,9 @@ def publish_site_directory(tensors, path, writer, metadata=None):
             os.fsync(handle.fileno())
         total = sum(p.stat().st_size for p in partial.iterdir())
         # Publish only after every site file and receipt is complete.
-        if os.name != "nt":
-            fd = os.open(partial, os.O_RDONLY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+        fsync_directory(partial)
         os.rename(partial, path)
-        if os.name != "nt":
-            fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+        fsync_directory(path.parent)
     except BaseException:
         shutil.rmtree(partial, ignore_errors=True)
         raise

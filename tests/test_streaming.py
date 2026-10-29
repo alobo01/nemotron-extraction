@@ -105,6 +105,53 @@ def test_inference_advances_while_writer_is_blocked(monkeypatch, tmp_path):
         handle.remove()
 
 
+def test_hf_per_site_layout_matches_monolithic_rows(tmp_path):
+    batches = [torch.tensor([[1, 2], [4, 5]]), torch.tensor([[7, 8]])]
+
+    async def run(extractor, directory):
+        return [item async for item in extractor.stream_to_disk(batches, directory)]
+
+    sites = [HookSite(0, "resid_pre"), HookSite(0, "resid_post")]
+    with HFExtractor(Model(), sites, device="cpu") as extractor:
+        monolithic = asyncio.run(run(extractor, tmp_path / "mono"))
+    with HFExtractor(Model(), sites, device="cpu", publication_layout="per_site", site_write_threads=2) as extractor:
+        per_site = asyncio.run(run(extractor, tmp_path / "sites"))
+        assert sorted(extractor.pool.free) == [0, 1]
+    for left, right in zip(monolithic, per_site):
+        assert right["finite_validation"] == "device" and right["path"].endswith(f"{right['index']:06d}")
+        saved = load_file(left["path"])
+        for key, record in right["files"].items():
+            assert torch.equal(load_file(record["path"])[key], saved[key])
+
+
+def test_hf_per_site_nonfinite_capture_publishes_nothing(tmp_path):
+    model = Model()
+    handle = model.model.layers[0].mixer.register_forward_hook(lambda module, args, output: output * float("nan"))
+
+    async def run(extractor):
+        with pytest.raises(ValueError, match="nonfinite"):
+            async for _ in extractor.stream_to_disk([torch.tensor([[1, 2]])], tmp_path):
+                pass
+
+    try:
+        with HFExtractor(model, [HookSite(0, "resid_post")], device="cpu", publication_layout="per_site") as extractor:
+            asyncio.run(run(extractor))
+            assert sorted(extractor.pool.free) == [0, 1]
+    finally:
+        handle.remove()
+    assert not list(tmp_path.iterdir())
+
+
+def test_monolithic_publication_is_synced_before_it_appears(monkeypatch, tmp_path):
+    import nemotron_extraction.transport as transport
+
+    synced = []
+    monkeypatch.setattr(transport, "fsync_file", lambda path: synced.append(path.exists()))
+    path = tmp_path / "x.safetensors"
+    publish({"x": torch.ones(2)}, path)
+    assert synced == [True] and path.exists()
+
+
 def test_atomic_failure_leaves_no_published_shard(tmp_path):
     path = tmp_path / "bad.safetensors"
     with pytest.raises(ValueError, match="nonfinite"):
