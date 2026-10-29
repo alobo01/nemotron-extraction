@@ -104,7 +104,9 @@ def main():
             saved = load_file(receipt["files"]["L2_resid_post"]["path"])["L2_resid_post"]
             files = len(receipt["files"])
             print(f"wave {receipt['index']}: {receipt['path']} ({files} files, rows {tuple(saved.shape)})")
-    assert torch.equal(
+    # Same rows as the in-memory call. Streaming runs the forward on a worker thread, where CPU matmul libraries
+    # may sum in another order, so compare to float tolerance rather than bit for bit.
+    torch.testing.assert_close(
         load_file(f"{out}/000000/L2_resid_post.safetensors")["L2_resid_post"], batch.activations["L2_resid_post"]
     )
 
