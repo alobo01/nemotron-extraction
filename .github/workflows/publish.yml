@@ -30,7 +30,20 @@ jobs:
           uvx ruff@0.9.4 check src benchmarks tests examples
           uvx ruff@0.9.4 format --check src benchmarks tests examples
       - name: Run tests
-        run: uv run --locked --group dev pytest -q
+        run: uv run --locked --group dev pytest -q --junitxml="$RUNNER_TEMP/pytest.xml"
+      - name: Annotate test failures
+        if: failure()
+        run: |
+          uv run --no-project python - "$RUNNER_TEMP/pytest.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ElementTree
+
+          for case in ElementTree.parse(sys.argv[1]).iter("testcase"):
+              for problem in [*case.iter("failure"), *case.iter("error")]:
+                  detail = (problem.get("message") or "") + " | " + (problem.text or "")[-600:]
+                  detail = detail.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+                  print(f"::error title={case.get('classname')}.{case.get('name')}::{detail}")
+          PY
       - name: Verify release version
         env:
           RELEASE_TAG: ${{ github.ref_name }}
