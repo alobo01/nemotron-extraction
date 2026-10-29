@@ -1,77 +1,111 @@
 # Nemotron extraction
 
-Capture token-aligned activations from NVIDIA's [Nemotron 3 Nano 30B A3B BF16 checkpoint](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16) with either Hugging Face Transformers (PyTorch) or vLLM. Both extractors share the same interface and save one row per input token at each selected model site.
+Capture token-aligned activations from NVIDIA's [Nemotron 3 Nano 30B A3B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16) with either Hugging Face Transformers (PyTorch) or vLLM. Both backends share one interface: you choose model sites, pass token IDs, and get one activation row per input token, in memory or as files on disk. The package was built to feed sparse-autoencoder training, where tokens per second and exact row alignment both matter.
 
 ## Install
 
-Python 3.10 or later is required. vLLM needs Linux and a supported NVIDIA GPU. Install the backend extras you plan to use:
+Python 3.10 or later. vLLM needs Linux and an NVIDIA GPU; the PyTorch backend also runs on a CPU.
 
 ```bash
 uv venv
-uv pip install 'nemotron-extraction[hf,vllm]==1.1.0'
+uv pip install 'nemotron-extraction[hf,vllm] @ git+https://github.com/alobo01/nemotron-extraction'
 ```
 
-Use `[hf]` or `[vllm]` alone to install just one backend.
+Use `[hf]` or `[vllm]` for one backend. The PyPI release, 1.1.0, predates chunked prefill, concurrent waves and the precision modes.
 
-## Quick start
+## Try it without a GPU
+
+[`examples/toy_extraction.py`](examples/toy_extraction.py) runs the real PyTorch extractor on a three-layer stand-in with Mamba, MoE and attention mixers, so it needs neither the checkpoint nor a GPU:
+
+```bash
+python examples/toy_extraction.py outputs/toy
+```
+
+```text
+L0_mamba_out             (10, 8)
+L1_moe_out               (10, 8)
+L2_attn_out_prelinear    (10, 8)
+L2_resid_post            (10, 8)
+wave 0: outputs/toy/000000 (5 files, rows (10, 8))
+wave 1: outputs/toy/000001 (5 files, rows (10, 8))
+```
+
+Two sequences of five tokens give ten rows per site. The streamed waves are directories of per-site files with a checksummed receipt, and their rows match the in-memory result.
+
+## Use with Nemotron 3 Nano
 
 ```python
 import torch
 from nemotron_extraction import HookSite, VLLMExtractor
 
-model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 sites = [HookSite(12, "resid_post"), HookSite(12, "attn_out_prelinear")]
-token_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+tokens = torch.randint(0, 1000, (8, 2048))  # [batch, sequence], int64, no padding
 
-with VLLMExtractor(model, sites, enable_chunked_prefill=True) as extractor:
-    batch = extractor.extract(token_ids)
-
-print(batch.activations["L12_resid_post"].shape)  # (3, hidden_width)
+with VLLMExtractor("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", sites, sequences_per_call=8) as extractor:
+    batch = extractor.extract(tokens)  # batch.activations["L12_resid_post"]: [8 * 2048, 2688] on the CPU
 ```
 
-For the PyTorch reference, replace `VLLMExtractor` with `HFExtractor` and install the `[hf]` extra. The model can also be supplied as a caller-owned PyTorch module to `HFExtractor`.
+`HFExtractor` takes the same arguments and also accepts a loaded PyTorch module. Both offer `extract`, `extract_async` and `stream_to_disk`, which yields one receipt per saved wave, in order. `HFExtractor.extract_device` keeps the activations on the GPU for live training. Neither backend generates text.
 
-Inputs are nonempty, rectangular `int64` token ID tensors with shape `[batch, sequence]`; padding is not supported. Each activation is a CPU tensor of shape `[batch × sequence, hidden_width]`, with sequences laid out in order. The extractor does not generate tokens.
-
-`HookSite(layer, kind)` uses a zero-based layer index. Supported kinds are:
+**Sites.** `HookSite(layer, kind)` uses zero-based layers. Each mixer kind exists only on layers of that type.
 
 | Kind | Captured value |
 |---|---|
 | `resid_pre`, `resid_post` | Residual stream entering or leaving the layer |
-| `mamba_out`, `moe_out`, `attn_out` | Layer mixer output, where that mixer exists |
+| `mamba_out`, `moe_out`, `attn_out` | Output of the layer's mixer |
 | `attn_out_prelinear` | Attention output before its output projection |
 
-Both extractors support `extract_async()` and `stream_to_disk()`. Disk streaming yields saved-shard receipts and keeps at most two batches in flight. `HFExtractor.extract_device()` returns CUDA activations for live training.
+**Options** (constructor arguments; vLLM only unless noted):
 
-For independently consumed site caches, `VLLMExtractor(..., publication_layout="per_site", site_write_threads=8)` writes each tensor to its own file and atomically publishes the containing directory. Version-2 receipts include paths, shapes, sizes and SHA-256 tensor checksums. This opt-in path validates finite values on the GPU before publication and avoids a CPU finite scan. `set_active_sites(sites)` can reduce the published sites between drained streams without reloading the model. The default monolithic layout remains unchanged.
+| Option | Effect |
+|---|---|
+| `sequences_per_call` | Prompts per capture wave; `"auto"` sizes it from an `AutoBatchConfig` memory profile |
+| `enable_chunked_prefill`, `max_num_batched_tokens` | Split long prompts across forward passes under a token budget |
+| `concurrent_waves`, `capture_slots` | Let up to `capture_slots` waves share forward passes, so the GPU is not idle between waves |
+| `publication_layout="per_site"`, `site_write_threads` | One file per site, written in parallel and published atomically with SHA-256 receipts (both backends) |
+| `precision="matched"` | IEEE float32 matmuls and, on vLLM, a float32 MoE router, matching the PyTorch reference (both backends) |
+| `set_active_sites`, `set_sequences_per_call` | Change sites or wave size between streams without reloading the model |
 
-For memory-bounded vLLM chunk sizes, set `sequences_per_call="auto"` and pass an `AutoBatchConfig` from `nemotron_extraction.batching`. Build its profile from a reference run; it accounts for model memory, per-sequence peak use, host capture and publication budgets.
+## How it works
 
-## Measured performance and agreement
+**Sites become hooks.** `hooks.py` finds the decoder layers and their mixers, and registers a forward hook per site. In PyTorch the hooks run on the model directly. In vLLM they run inside the GPU worker process, through a worker extension, so activations never pass through the engine's output path.
 
-In the recorded H200 run, the package's BF16 vLLM path saved activations at **5,535 input tokens/s** versus **3,930** for Transformers at batch size 64 (**1.41×**). A sibling fill-writer implementation reached **24,079 tokens/s** (**6.13×**). These figures cover 131,072 English tokens across 18 sites and describe package version 1.0.0; they are not a measurement of version 1.1.0. Each vLLM path passed the report's strict numerical agreement gates at only 3 of 18 sites. See the one-page [speed and agreement report](docs/report.pdf), its [source](docs/report.tex), and the [timing receipts](docs/extraction_speed_results.json) for scope and limitations.
+**Rows are routed by request and offset.** vLLM flattens all scheduled prompts into one token batch per forward pass. Before each pass the worker reads the scheduler's metadata: request ID, tokens already computed and position in the flat batch. It then copies each request's slice to `row × length + offset` in that wave's output. This keeps rows exact under chunked prefill, interleaved requests and waves that share a pass. A span that arrives out of order, as after a pre-emption, fails the wave instead of being written.
 
-## Repository guide
+**Copies and writes overlap the forward pass.** Captured tensors are copied to pinned host buffers on a separate CUDA stream. A wave is published only after all its spans have arrived. Writer threads then validate, checksum, sync and rename the files, while the GPU runs the next wave. The number of buffer slots bounds host memory.
 
-- `src/nemotron_extraction/` — public extractors, model hooks, vLLM worker and shard transport.
-- `benchmarks/` — six standalone validation, throughput and attribution tools; see the [benchmark guide](benchmarks/README.md).
-- `docs/` — report, measured speed receipts and controlled numerical experiments.
-- `tests/` — package, benchmark and smoke tests.
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `src/nemotron_extraction/types.py` | `HookSite`, site kinds and the `ActivationBatch` result types |
+| `src/nemotron_extraction/hooks.py` | Topology discovery and hook installation (residual, mixer, pre-projection) |
+| `src/nemotron_extraction/hf.py` | `HFExtractor`: the PyTorch backend and reference |
+| `src/nemotron_extraction/vllm.py` | `VLLMExtractor`: engine set-up, wave admission and the ordered receipt stream |
+| `src/nemotron_extraction/worker.py` | vLLM worker extension: per-request spans, GPU-to-host copies and wave sealing |
+| `src/nemotron_extraction/transport.py` | Pinned buffer pool and durable monolithic or per-site publication |
+| `src/nemotron_extraction/precision.py` | Native and matched precision modes, including the float32 router |
+| `src/nemotron_extraction/batching.py` | `AutoBatchConfig`: wave size from a memory profile |
+| `examples/` | The CPU toy above |
+| `benchmarks/` | Validation, speed and numerical-diagnosis tools; see the [benchmark guide](benchmarks/README.md) |
+| `docs/` | Report and receipts of earlier speed and numerical studies |
+| `tests/` | CPU tests with stand-in models and a fake chunking engine; no GPU needed |
+
+## Validation and speed
+
+On an H100, with 18 sites and per-site saving, vLLM ran the forward pass at 56,000–62,000 tokens/s for prompts of 1,024–16,384 tokens in waves of four or more prompts. The PyTorch backend reached 10,700–12,300. Writing to a network filesystem at about 5 GB/s, roughly 47,000 tokens/s for 18 sites, then caps end-to-end extraction at about 30,000 tokens/s for prompts of 4,096 tokens or more, against 7,000 for PyTorch. Concurrent waves produced the same activations as waves run one at a time with the same token budget.
+
+Activations from the two backends differ by bfloat16 rounding, mostly from Mamba and MoE kernels that sum in a different order. Compared with a float32 reference run on 4,096 English tokens, both backends were equally close at every site. At the worst site, layer 27's MoE output, the relative L2 error was 0.092 for PyTorch and 0.104 for vLLM (0.091 with chunked prefill). `benchmarks/validate.py` and `benchmarks/scaling.py` reproduce these measurements.
 
 ## Development
-
-From a checkout, install development dependencies and run the checks:
 
 ```bash
 uv sync --group dev
 uv run pytest
-uvx ruff check src benchmarks tests
-uvx ruff format --check src benchmarks tests
+uvx ruff check src benchmarks tests examples
 uv build
 ```
 
-The report source can be compiled with `pdflatex -output-directory=docs docs/report.tex`.
-
 ## Citation and licence
 
-See [CITATION.bib](CITATION.bib) for citation details. The package is MIT licensed; see [LICENSE](LICENSE). Model weights and datasets have their own licences.
+See [CITATION.bib](CITATION.bib). The code is MIT licensed ([LICENSE](LICENSE)); model weights and datasets carry their own licences.
