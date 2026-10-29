@@ -83,8 +83,12 @@ class ToyNemotron(nn.Module):
 def main():
     out = Path(sys.argv[1] if len(sys.argv) > 1 else "outputs/toy_extraction")
     torch.manual_seed(0)
-    sites = [HookSite(0, "mamba_out"), HookSite(1, "moe_out"), HookSite(2, "attn_out_prelinear"),
-             HookSite(2, "resid_post")]
+    sites = [
+        HookSite(0, "mamba_out"),
+        HookSite(1, "moe_out"),
+        HookSite(2, "attn_out_prelinear"),
+        HookSite(2, "resid_post"),
+    ]
     tokens = torch.randint(0, 100, (2, 5))  # [batch, sequence], int64, no padding
 
     with HFExtractor(ToyNemotron(), sites, device="cpu", publication_layout="per_site") as extractor:
@@ -100,8 +104,9 @@ def main():
             saved = load_file(receipt["files"]["L2_resid_post"]["path"])["L2_resid_post"]
             files = len(receipt["files"])
             print(f"wave {receipt['index']}: {receipt['path']} ({files} files, rows {tuple(saved.shape)})")
-    assert torch.equal(load_file(f"{out}/000000/L2_resid_post.safetensors")["L2_resid_post"],
-                       batch.activations["L2_resid_post"])
+    assert torch.equal(
+        load_file(f"{out}/000000/L2_resid_post.safetensors")["L2_resid_post"], batch.activations["L2_resid_post"]
+    )
 
 
 if __name__ == "__main__":

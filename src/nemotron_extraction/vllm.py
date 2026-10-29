@@ -338,10 +338,14 @@ class VLLMExtractor(Extractor):
                         # actually executed, never once per queued receipt.
                         self.sequences_per_call = max(frame, call_sequences // 2 // frame * frame)
                 self.last_memory_window = dict(
-                    sequences=call_sequences, next_sequences=self.sequences_per_call,
-                    live_peak_bytes=self._phase_live, reserved_peak_bytes=self._phase_reserved,
-                    driver_peak_bytes=self._phase_driver, external_bytes=self._phase_external,
-                    total_bytes=self._phase_total, driver_after_trim_bytes=current_used,
+                    sequences=call_sequences,
+                    next_sequences=self.sequences_per_call,
+                    live_peak_bytes=self._phase_live,
+                    reserved_peak_bytes=self._phase_reserved,
+                    driver_peak_bytes=self._phase_driver,
+                    external_bytes=self._phase_external,
+                    total_bytes=self._phase_total,
+                    driver_after_trim_bytes=current_used,
                     pressure=pressure,
                 )
 

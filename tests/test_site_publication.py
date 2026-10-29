@@ -1,8 +1,10 @@
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 import torch
 from safetensors.torch import load_file
+
 from nemotron_extraction.transport import publish_site_directory
 
 
@@ -34,8 +36,9 @@ def test_site_write_failure_never_publishes_partial_directory(tmp_path, monkeypa
 
 
 def test_failed_device_check_prevents_any_publication(tmp_path):
-    from nemotron_extraction.worker import ActivationHookExtension
     from concurrent.futures import Future
+
+    from nemotron_extraction.worker import ActivationHookExtension
 
     copied = Future()
     copied.set_result(0.0)

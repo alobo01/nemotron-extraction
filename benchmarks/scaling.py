@@ -243,7 +243,10 @@ def run_hf(args, sites, stream, record):
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(
-        record["model_path"], torch_dtype=torch.bfloat16, device_map="cuda", trust_remote_code=True,
+        record["model_path"],
+        torch_dtype=torch.bfloat16,
+        device_map="cuda",
+        trust_remote_code=True,
         local_files_only=True,
     )
     with HFExtractor(model, sites, publication_layout="per_site", precision=args.precision) as extractor:
@@ -260,23 +263,32 @@ def run_hf(args, sites, stream, record):
             torch.cuda.reset_peak_memory_stats()
             try:
                 if saving:
-                    before = dict(counters(extractor), forward=extractor.model_forward_seconds,
-                                  copy=extractor.cpu_copy_seconds)
+                    before = dict(
+                        counters(extractor), forward=extractor.model_forward_seconds, copy=extractor.cpu_copy_seconds
+                    )
                     started = time.perf_counter()
                     receipts = asyncio.run(stream_cell(extractor, waves, directory))
                     wall = time.perf_counter() - started
                     forward = extractor.model_forward_seconds - before["forward"]
                     copy = extractor.cpu_copy_seconds - before["copy"]
                     for receipt in receipts:  # HF receipts carry no worker timings
-                        receipt.update(worker_forward_seconds=forward / len(receipts),
-                                       worker_copy_seconds=copy / len(receipts),
-                                       actual_forward_batches=[batch])
+                        receipt.update(
+                            worker_forward_seconds=forward / len(receipts),
+                            worker_copy_seconds=copy / len(receipts),
+                            actual_forward_batches=[batch],
+                        )
                     cell.update(summarise(receipts, 2 * batch * length, wall, before, counters(extractor), True))
                 else:
                     wall, forward = hf_forward_only(extractor, waves)
                     tokens = 2 * batch * length
-                    cell.update(tokens=tokens, saving=False, wall_seconds=wall, forward_seconds=forward,
-                                end_to_end_tokens_per_second=tokens / wall, forward_tokens_per_second=tokens / forward)
+                    cell.update(
+                        tokens=tokens,
+                        saving=False,
+                        wall_seconds=wall,
+                        forward_seconds=forward,
+                        end_to_end_tokens_per_second=tokens / wall,
+                        forward_tokens_per_second=tokens / forward,
+                    )
                 cell.update(status="ok", peak_device_memory_bytes=torch.cuda.max_memory_allocated())
             except Exception as error:
                 cell.update(status="memory failure" if is_memory_failure(error) else "error", error=repr(error))

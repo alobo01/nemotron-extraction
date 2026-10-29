@@ -217,17 +217,17 @@ def test_active_site_reduction_waits_for_a_drained_boundary(worker, tmp_path):
 
 
 def test_memory_window_requires_drained_publications_and_resets_peaks(worker, monkeypatch):
-    calls=[]
+    calls = []
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 10)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("trim"))
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: calls.append("reset"))
-    result=worker.nh_memory_window(True)
-    assert result["external_device_memory_bytes"]==10
-    assert calls==["trim","reset"]
-    worker.nh_waves={"busy":{}}
-    with pytest.raises(RuntimeError,match="Drain"):
+    result = worker.nh_memory_window(True)
+    assert result["external_device_memory_bytes"] == 10
+    assert calls == ["trim", "reset"]
+    worker.nh_waves = {"busy": {}}
+    with pytest.raises(RuntimeError, match="Drain"):
         worker.nh_memory_window()
-    worker.nh_waves={}
+    worker.nh_waves = {}
 
 
 def test_one_prompt_split_into_three_chunks_keeps_row_order(worker, tmp_path):
