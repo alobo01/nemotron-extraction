@@ -10,7 +10,8 @@ description = "Small, token-aligned activation hooks for Nemotron in PyTorch and
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-dependencies = ["torch>=2.7", "safetensors>=0.4.5"]
+# numpy backs tensor checksums and safetensors' save_file; torch does not install it.
+dependencies = ["torch>=2.7", "safetensors>=0.4.5", "numpy>=1.24"]
 
 [project.urls]
 Organization = "https://www.dfki.de/"
