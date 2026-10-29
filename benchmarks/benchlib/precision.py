@@ -17,54 +17,12 @@ from safetensors import safe_open
 from torch import nn
 
 from nemotron_extraction.hooks import layers_of
+from nemotron_extraction.precision import fp32_backends, ieee_settings, precision_settings, set_precision
 
 from .common import tensor_digest, write_json
 from .stats import TokenDiagnostics
 
-
-def fp32_backends():
-    """Backends exposing ``fp32_precision``; resolved lazily because older torch lacks them."""
-    return (
-        ("global", torch.backends),
-        ("matmul", torch.backends.cuda.matmul),
-        ("cudnn", torch.backends.cudnn),
-        ("conv", torch.backends.cudnn.conv),
-        ("rnn", torch.backends.cudnn.rnn),
-    )
-
-
-def precision_settings():
-    # Do not mix the legacy TF32 API with the API introduced after torch 2.9.
-    modern = tuple(int(x) for x in str(torch.__version__).split("+")[0].split(".")[:2]) >= (2, 9)
-    if modern:
-        settings = {name: owner.fp32_precision for name, owner in fp32_backends()}
-    else:
-        settings = dict(matmul_tf32=torch.backends.cuda.matmul.allow_tf32, cudnn_tf32=torch.backends.cudnn.allow_tf32)
-    settings.update(
-        api="modern" if modern else "legacy",
-        bf16_reduced_reduction=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
-    )
-    return settings
-
-
-def set_precision(settings):
-    if settings["api"] == "modern":
-        for name, owner in fp32_backends():
-            owner.fp32_precision = settings[name]
-    else:
-        torch.backends.cuda.matmul.allow_tf32 = settings["matmul_tf32"]
-        torch.backends.cudnn.allow_tf32 = settings["cudnn_tf32"]
-    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = settings["bf16_reduced_reduction"]
-
-
-def ieee_settings():
-    settings = precision_settings()
-    if settings["api"] == "modern":
-        settings.update({name: "ieee" for name, _ in fp32_backends()})
-    else:
-        settings.update(matmul_tf32=False, cudnn_tf32=False)
-    settings["bf16_reduced_reduction"] = False
-    return settings
+__all__ = ["fp32_backends", "ieee_precision", "ieee_settings", "precision_settings", "set_precision"]
 
 
 @contextmanager
