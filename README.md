@@ -95,7 +95,16 @@ with VLLMExtractor("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", sites, sequence
 
 On an H100, with 18 sites and per-site saving, vLLM ran the forward pass at 56,000–62,000 tokens/s for prompts of 1,024–16,384 tokens in waves of four or more prompts. The PyTorch backend reached 10,700–12,300. Writing to a network filesystem at about 5 GB/s, roughly 47,000 tokens/s for 18 sites, then caps end-to-end extraction at about 30,000 tokens/s for prompts of 4,096 tokens or more, against 7,000 for PyTorch. Concurrent waves produced the same activations as waves run one at a time with the same token budget.
 
-Activations from the two backends differ by bfloat16 rounding, mostly from Mamba and MoE kernels that sum in a different order. Compared with a float32 reference run on 4,096 English tokens, both backends were equally close at every site. At the worst site, layer 27's MoE output, the relative L2 error was 0.092 for PyTorch and 0.104 for vLLM (0.091 with chunked prefill). `benchmarks/validate.py` and `benchmarks/scaling.py` reproduce these measurements.
+Activations from the two backends differ by bfloat16 rounding, mostly from Mamba and MoE kernels that sum in a different order. Against a float32 PyTorch reference over 65,536 tokens each of English, German and Spanish, both backends are equally close at every site:
+
+| Candidate | Relative L2, mean of 18 sites | Relative L2, worst site (layer 27 MoE output) | Mean cosine |
+|---|---|---|---|
+| PyTorch, bfloat16 | 0.037 | 0.104 | 0.999 |
+| vLLM, bfloat16 | 0.037 | 0.105 | 0.999 |
+| vLLM, bfloat16, 512-token chunked prefill | 0.037 | 0.105 | 0.999 |
+| vLLM, float32 | 0.019 | 0.061 | 0.9997 |
+
+vLLM in float32 is closer but not identical to PyTorch in float32, because its kernels still sum in a different order. `benchmarks/validate.py` and `benchmarks/scaling.py` reproduce these measurements.
 
 ## Development
 

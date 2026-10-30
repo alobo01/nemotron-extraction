@@ -31,6 +31,16 @@ uv run benchmarks/validate.py backend --backend vllm --work outputs/tokens --lan
     --reference outputs/val/hf/reference --output outputs/val/vllm
 ```
 
+A float32 PyTorch run is the ground truth for judging both backends. Use batch size 1, because the float32 PyTorch Mamba path needs far more memory per sequence. Offload part of the model if the GPU cannot hold its 126 GB of weights:
+
+```bash
+uv run benchmarks/validate.py backend --backend hf --dtype float32 --hf-device-map auto \
+    --hf-max-gpu-memory 110GiB --work outputs/tokens --language en --tokens 65536 --batch-size 1 \
+    --output outputs/val/hf-fp32
+uv run benchmarks/validate.py backend --backend vllm --reference outputs/val/hf-fp32/reference \
+    --work outputs/tokens --language en --tokens 65536 --batch-size 1 --output outputs/val/vllm
+```
+
 Options select what is compared:
 
 | Option | Effect |
