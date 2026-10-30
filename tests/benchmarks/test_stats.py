@@ -49,6 +49,22 @@ def test_normalized_mse_uses_shared_reference_scale():
         assert scaled.result()["normalized_mse"] == pytest.approx(0.25)
 
 
+def test_worst_one_percent_tails_cover_the_worst_tokens():
+    reference = torch.ones(200, 2)
+    candidate = reference.clone()
+    candidate[7] = torch.tensor([1.0, 3.0])
+    candidate[8] = torch.tensor([-1.0, 1.0])
+    metric = Agreement()
+    metric.add(reference, candidate)
+    result = metric.result()
+    # Two tokens are the worst 1% of 200: their errors are 4 and 4, against 2 reference energy per token.
+    assert result["worst_one_percent_normalized_mse"] == pytest.approx(2.0)
+    assert result["worst_one_percent_mean_cosine"] == pytest.approx((0.0 + 0.8944272) / 2, abs=1e-6)
+    merged = Agreement()
+    merged.merge_result(result, torch.cat(metric.cosines))
+    assert merged.result()["worst_one_percent_normalized_mse"] is None
+
+
 def test_normalized_mse_accumulates_before_normalization():
     metric = Agreement()
     metric.add(torch.tensor([[1.0, 0.0]]), torch.tensor([[2.0, 0.0]]))

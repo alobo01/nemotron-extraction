@@ -21,10 +21,11 @@ def normalized_mse(error_squared_sum, reference_squared_sum):
 
 
 class Agreement:
-    """FP32 differences and norms, accumulated in float64; exact cosine quantiles."""
+    """FP32 differences and norms, accumulated in float64; exact cosine quantiles and worst-1% tails."""
 
     def __init__(self):
-        self.cosines, self.error2, self.reference2, self.max_error = [], 0.0, 0.0, 0.0
+        self.cosines, self.row_errors = [], []
+        self.error2, self.reference2, self.max_error = 0.0, 0.0, 0.0
 
     def add(self, reference, candidate):
         # A float32 reference may judge a lower-precision candidate; otherwise dtypes must match.
@@ -35,7 +36,9 @@ class Agreement:
             if not bool(torch.isfinite(left).all() and torch.isfinite(right).all()):
                 raise ValueError("Nonfinite activations")
             diff = right - left
-            self.error2 += float(diff.double().square().sum())
+            row_error = diff.double().square().sum(-1)
+            self.row_errors.append(row_error.float())
+            self.error2 += float(row_error.sum())
             self.reference2 += float(left.double().square().sum())
             self.max_error = max(self.max_error, float(diff.abs().max()))
             a, b = left.norm(dim=-1), right.norm(dim=-1)
@@ -51,8 +54,17 @@ class Agreement:
         self.reference2 += result["reference_squared_sum"]
         self.max_error = max(self.max_error, result["maximum_absolute_error"])
 
+    def _worst_mse(self, errors, tail):
+        """Mean per-token normalised MSE over the worst 1% of tokens, on the site-wide reference scale."""
+        if errors is None or not self.reference2:
+            return None
+        return float(errors.double().sort(descending=True).values[:tail].mean()) * len(errors) / self.reference2
+
     def result(self):
         cosine = torch.cat(self.cosines)
+        tail = max(1, math.ceil(0.01 * len(cosine)))
+        # Merged results carry cosines only, so their MSE tail is unknown.
+        errors = torch.cat(self.row_errors) if sum(map(len, self.row_errors)) == len(cosine) else None
         # A zero reference has relative error zero only when the candidate is also zero.
         nmse = normalized_mse(self.error2, self.reference2)
         relative = math.sqrt(nmse) if nmse is not None else None
@@ -61,6 +73,8 @@ class Agreement:
             "mean_cosine": float(cosine.mean()),
             "minimum_cosine": float(cosine.min()),
             "first_percentile_cosine": float(cosine.quantile(0.01)),
+            "worst_one_percent_mean_cosine": float(cosine.sort().values[:tail].mean()),
+            "worst_one_percent_normalized_mse": self._worst_mse(errors, tail),
             "relative_l2": relative,
             "normalized_mse": nmse,
             "mse_normalization": "shared_hf_rms_per_site",
