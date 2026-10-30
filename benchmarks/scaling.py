@@ -293,6 +293,8 @@ def run_hf(args, sites, stream, record):
             except Exception as error:
                 cell.update(status="memory failure" if is_memory_failure(error) else "error", error=repr(error))
                 cell["traceback"] = traceback.format_exc()[-4000:]
+                if cell["status"] == "error":  # cleanup after a CUDA fault can abort the process
+                    print(cell["traceback"], flush=True)
                 extractor.captured.clear()
                 gc.collect()
                 torch.cuda.empty_cache()
