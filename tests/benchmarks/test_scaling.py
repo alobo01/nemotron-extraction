@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import scaling
 import torch
@@ -27,3 +29,11 @@ def test_two_waves_come_from_the_start_of_the_stream_repeated_when_short():
     assert first.tolist() == [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]] and second[0, 0] == 10
     first, second = scaling.wave_inputs(torch.arange(7), 5, 2)
     assert second.flatten().tolist() == [3, 4, 5, 6, 0, 1, 2, 3, 4, 5]
+
+
+def test_only_pytorch_cells_above_its_forward_limit_are_skipped():
+    hf = SimpleNamespace(config="hf", wave_token_cap=1 << 20)
+    assert scaling.skip_reason(hf, 208_000) is None
+    assert "PyTorch forward" in scaling.skip_reason(hf, 262_144)
+    assert scaling.skip_reason(SimpleNamespace(config="vllm-whole", wave_token_cap=1 << 20), 262_144) is None
+    assert "token cap" in scaling.skip_reason(SimpleNamespace(config="hf", wave_token_cap=1000), 2000)

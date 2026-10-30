@@ -59,6 +59,7 @@ Each comparison reports, per site, mean, minimum and first-percentile cosine sim
 
 - **Saving cap:** cells whose wave exceeds `--saving-cap-bytes` capture on the GPU and skip the copy and write, so very large cells measure the forward pass only.
 - **Storage:** written shards are deleted as soon as their receipt arrives.
+- **PyTorch limit:** one PyTorch forward pass cannot exceed about 208,000 tokens (prompt length × batch size). From about 200,000 tokens an 80–94 GB GPU runs out of memory in the Mamba scan. A GPU with more memory crashes instead: above 208,423 tokens, `mamba_ssm`'s `_chunk_cumsum_fwd_kernel` computes its offset into the 10,304-wide `in_proj` output with 32-bit integers, and the offset passes 2³¹. Probes at prompt lengths of 2,048, 4,096 and 8,192 tokens all switched from out-of-memory to a crash between 206,848 and 208,896 tokens. `scaling.py` skips PyTorch cells above 208,000 tokens (`not run: PyTorch forward above its token limit`); vLLM cells are not skipped.
 
 ```bash
 uv run benchmarks/scaling.py run --config vllm-continuous --work outputs/tokens --sites sites.json \

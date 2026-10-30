@@ -39,6 +39,9 @@ from nemotron_extraction.worker import ActivationHookExtension
 LENGTHS = (1024, 4096, 16384, 65536, 100000)
 BATCHES = (1, 4, 16, 64)
 WAVE_TOKEN_CAP = 1 << 20
+# One PyTorch forward over more tokens aborts the process: mamba_ssm's Triton scan indexes the 10,304-wide in_proj
+# output with 32-bit offsets, which overflow at 2**31 / 10,304 = 208,423 tokens.
+HF_FORWARD_TOKEN_LIMIT = 208_000
 CONFIGS = {
     # name: backend, extractor options; whole prefill gets a budget of one longest prompt
     "hf": ("hf", {}),
@@ -167,6 +170,15 @@ def summarise(receipts, tokens, wall, before, after, saving):
     )
 
 
+def skip_reason(args, tokens):
+    """Why a cell with this many tokens per wave is not run, or None."""
+    if tokens > args.wave_token_cap:
+        return "not run: wave above token cap"
+    if args.config == "hf" and tokens > HF_FORWARD_TOKEN_LIMIT:
+        return "not run: PyTorch forward above its token limit"
+    return None
+
+
 def run_vllm(args, options, sites, stream, record):
     max_model_len = max(args.lengths) + 1
     options = dict(options)
@@ -196,8 +208,9 @@ def run_vllm(args, options, sites, stream, record):
         for length, batch in cells(args.lengths, args.batches):
             cell = dict(length=length, batch=batch)
             record["cells"].append(cell)
-            if batch * length > args.wave_token_cap:
-                cell["status"] = "not run: wave above token cap"
+            reason = skip_reason(args, batch * length)
+            if reason:
+                cell["status"] = reason
                 continue
             saving = batch * length * args.bytes_per_token <= args.saving_cap_bytes
             directory = args.output / "scratch" / f"L{length}-B{batch}"
@@ -254,8 +267,9 @@ def run_hf(args, sites, stream, record):
         for length, batch in cells(args.lengths, args.batches):
             cell = dict(length=length, batch=batch)
             record["cells"].append(cell)
-            if batch * length > args.wave_token_cap:
-                cell["status"] = "not run: wave above token cap"
+            reason = skip_reason(args, batch * length)
+            if reason:
+                cell["status"] = reason
                 continue
             saving = batch * length * args.bytes_per_token <= args.saving_cap_bytes
             directory = args.output / "scratch" / f"L{length}-B{batch}"
