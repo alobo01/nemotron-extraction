@@ -95,6 +95,8 @@ with VLLMExtractor("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", sites, sequence
 
 On an H100, with 18 sites and per-site saving, vLLM ran the forward pass at 56,000–62,000 tokens/s for prompts of 1,024–16,384 tokens in waves of four or more prompts. The PyTorch backend reached 10,700–12,300. Writing to a network filesystem at about 5 GB/s, roughly 47,000 tokens/s for 18 sites, then caps end-to-end extraction at about 30,000 tokens/s for prompts of 4,096 tokens or more, against 7,000 for PyTorch. Concurrent waves produced the same activations as waves run one at a time with the same token budget.
 
+On an H200, forward-only, vLLM's forward speed falls with prompt length: 57,000 tokens/s at 16,384 tokens, 46,000 at 65,536, 37,000 at 131,072 and 26,000 at 262,000. It does not depend on batch size (16 to 256 prompts at 16,384 tokens) or on whether prefill is chunked in 8,192-token steps or continuous. Whole-prompt prefill needs a 262,001-token step for the longest prompts and ran out of memory in the Mamba scan on the 140 GB GPU, so chunked prefill is also what makes the longest prompts possible.
+
 Activations from the two backends differ by bfloat16 rounding, mostly from Mamba and MoE kernels that sum in a different order. Against a float32 PyTorch reference over 65,536 tokens each of English, German and Spanish, both backends are equally close at every site:
 
 | Candidate | Relative L2, mean of 18 sites | Relative L2, worst site (layer 27 MoE output) | Mean cosine |
