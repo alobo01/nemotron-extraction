@@ -5,4 +5,4 @@ from .types import ActivationBatch, DeviceActivationBatch, HookSite
 from .vllm import VLLMExtractor
 
 __all__ = ["ActivationBatch", "DeviceActivationBatch", "HookSite", "HFExtractor", "VLLMExtractor"]
-__version__ = "1.1.0"
+__version__ = "1.2.0"
