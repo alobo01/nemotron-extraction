@@ -17,7 +17,7 @@ def decoder_of(model: nn.Module) -> nn.Module:
 
 
 def layers_of(model: nn.Module):
-    for path in ("model.layers", "backbone.layers", "layers"):
+    for path in ("model.layers", "backbone.layers", "language_model.model.layers", "layers"):
         try:
             layers = model.get_submodule(path)
             if len(layers):
