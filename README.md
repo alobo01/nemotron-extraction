@@ -83,6 +83,7 @@ with VLLMExtractor("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", sites, sequence
 | `src/nemotron_extraction/hf.py` | `HFExtractor`: the PyTorch backend and reference |
 | `src/nemotron_extraction/vllm.py` | `VLLMExtractor`: engine set-up, wave admission and the ordered receipt stream |
 | `src/nemotron_extraction/worker.py` | vLLM worker extension: per-request spans, GPU-to-host copies and wave sealing |
+| `src/nemotron_extraction/aggregate.py` | `AggregateExtractor`: per-group sums of block outputs, reduced on the GPU |
 | `src/nemotron_extraction/transport.py` | Pinned buffer pool and durable monolithic or per-site publication |
 | `src/nemotron_extraction/precision.py` | Native and matched precision modes, including the float32 router |
 | `src/nemotron_extraction/batching.py` | `AutoBatchConfig`: wave size from a memory profile |
@@ -90,6 +91,12 @@ with VLLMExtractor("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", sites, sequence
 | `benchmarks/` | Validation, speed and numerical-diagnosis tools; see the [benchmark guide](benchmarks/README.md) |
 | `docs/` | Report and receipts of earlier speed and numerical studies |
 | `tests/` | CPU tests with stand-in models and a fake chunking engine; no GPU needed |
+
+## Group means without files
+
+When only a mean per group is needed, such as a language vector, nothing has to be copied or saved. `AggregateExtractor` adds each prompt token's block output to a float64 accumulator of shape `[layers, groups, width]` inside the vLLM workers. Prompts of any length share forwards under chunked prefill, and one RPC at the end returns the sums. It needs a vLLM decoder whose layers return `(hidden_states, residual)`, which holds for Nemotron-H and Qwen3.5. `benchmarks/language_centroids.py` runs it over a manifest of sentences.
+
+On Qwen3.5-397B-A17B-FP8 (4 × B200, tensor parallel, 5 languages, 15,585 sentences, 433,830 tokens, the 60 block outputs), the extraction takes 19 s, or 22,400 tokens/s. The vLLM-Hook backend took 1,342 s (323 tokens/s) on the same manifest, which is 69 times slower. Engine start-up took 2,380 s in that job, most of it two workers starved of CPU cores (see the benchmark guide); the weights themselves loaded in 77 s on the two unaffected ranks. A discarded warm-up pass added 97 s and absorbs kernel tuning. The sums agree with Transformers on Qwen2.5-1.5B in a 600-sentence check: identical token counts, a worst relative error of 0.13% in bfloat16 and cosine 0.999999. They were not compared with another backend on the 397B model.
 
 ## Validation and speed
 

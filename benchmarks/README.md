@@ -16,6 +16,7 @@ Every script has `--help`. Write each experiment to a new output directory: rece
 | `scaling.py` | How do forward speed and saving speed change with prompt length and batch size? |
 | `sweep.py` | How do throughput and agreement change with batch size, at 2,048-token prompts? |
 | `extraction_speed.py` | How does the package compare with the nemotron-sae extraction methods? (historical study, see `../docs/report.pdf`) |
+| `language_centroids.py` | How fast are per-language mean block outputs when nothing is saved? See the main README. |
 | `diagnose_divergence.py` | At which operation do the two backends first disagree? |
 | `precision_validation.py`, `moe_attribution.py` | Is a disagreement explained by Mamba or MoE arithmetic? See [`../docs/moe_validation.md`](../docs/moe_validation.md). |
 
@@ -65,6 +66,12 @@ Each comparison reports, per site, mean, minimum and first-percentile cosine sim
 uv run benchmarks/scaling.py run --config vllm-continuous --work outputs/tokens --sites sites.json \
     --bytes-per-token 105216 --output outputs/scaling
 ```
+
+## Language centroids
+
+`language_centroids.py` reads a JSONL manifest (`language_nllb`, `example_id`, `text`) and writes `centroids.safetensors` and `runtime.json`. It first runs `--warmup` rows (default 512) and discards them, so `extraction_seconds` excludes first-use kernel compilation and tuning; `engine_startup_seconds` and `warmup_seconds` report those separately. Pass further vLLM engine arguments as JSON, for example `--engine-options '{"language_model_only": true}'` for a multimodal checkpoint.
+
+On a shared node, check the CPU affinity of the vLLM workers (`taskset -cp PID`). On a 4-GPU job the two workers nearest the second CPU socket were pinned to 4 cores and spent over an hour in vLLM's CPU-side FP8 expert-weight shuffle, while the other two finished in minutes. `taskset -a -pc LIST PID` on the slow workers fixed it. `NCCL_IGNORE_CPU_AFFINITY=1` did not.
 
 ## Environment settings
 
