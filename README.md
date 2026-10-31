@@ -95,16 +95,32 @@ with VLLMExtractor("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", sites, sequence
 
 On an H100, with 18 sites and per-site saving, vLLM ran the forward pass at 56,000–62,000 tokens/s for prompts of 1,024–16,384 tokens in waves of four or more prompts. The PyTorch backend reached 10,700–12,300. Writing to a network filesystem at about 5 GB/s, roughly 47,000 tokens/s for 18 sites, then caps end-to-end extraction at about 30,000 tokens/s for prompts of 4,096 tokens or more, against 7,000 for PyTorch. Concurrent waves produced the same activations as waves run one at a time with the same token budget.
 
+Speedup of vLLM over PyTorch on the same H100 grid, as forward-only speed and as end-to-end speed with per-site saving:
+
+| Prompt length | Prompts per wave | Forward only | With saving |
+|---|---|---|---|
+| 1,024 | 1 | 12.7× | 4.6× |
+| 1,024 | 4 | 21.1× | 5.5× |
+| 1,024 | 16 | 9.7× | 3.3× |
+| 1,024 | 64 | 5.7× | 2.5× |
+| 4,096 | 1 | 9.6× | 4.7× |
+| 4,096 | 4 | 5.8× | 4.3× |
+| 4,096 | 16 | 5.0× | 4.4× |
+
+The speedup falls as the wave grows because PyTorch gets faster with batch size while vLLM is already saturated at four prompts. PyTorch cannot run larger cells (see the [benchmark guide](benchmarks/README.md)).
+
 On an H200, forward-only, vLLM's forward speed falls with prompt length: 57,000 tokens/s at 16,384 tokens, 46,000 at 65,536, 37,000 at 131,072 and 26,000 at 262,000. It does not depend on batch size (16 to 256 prompts at 16,384 tokens) or on whether prefill is chunked in 8,192-token steps or continuous. Whole-prompt prefill needs a 262,001-token step for the longest prompts and ran out of memory in the Mamba scan on the 140 GB GPU, so chunked prefill is also what makes the longest prompts possible.
 
 Activations from the two backends differ by bfloat16 rounding, mostly from Mamba and MoE kernels that sum in a different order. Against a float32 PyTorch reference over 65,536 tokens each of English, German and Spanish, both backends are equally close at every site:
 
-| Candidate | Relative L2, mean of 18 sites | Relative L2, worst site (layer 27 MoE output) | Mean cosine |
-|---|---|---|---|
-| PyTorch, bfloat16 | 0.037 | 0.104 | 0.999 |
-| vLLM, bfloat16 | 0.037 | 0.105 | 0.999 |
-| vLLM, bfloat16, 512-token chunked prefill | 0.037 | 0.105 | 0.999 |
-| vLLM, float32 | 0.019 | 0.061 | 0.9997 |
+| Candidate | Relative L2, mean of 18 sites | Relative L2, worst site (layer 27 MoE output) | Cosine, mean | Cosine, worst 1% of tokens | MSE, mean | MSE, worst 1% of tokens |
+|---|---|---|---|---|---|---|
+| PyTorch, bfloat16 | 0.037 | 0.104 | 0.9989 | 0.9807 | 0.0020 | 0.038 |
+| vLLM, bfloat16 | 0.037 | 0.105 | 0.9989 | 0.9805 | 0.0020 | 0.039 |
+| vLLM, bfloat16, 512-token chunked prefill | 0.037 | 0.105 | 0.9989 | 0.9805 | 0.0020 | 0.039 |
+| vLLM, float32 | 0.019 | 0.061 | 0.9997 | 0.9901 | 0.0006 | 0.019 |
+
+MSE is the squared error divided by the site's mean squared activation, so it equals the squared relative L2 error. The worst-1% columns average the per-token cosine or MSE over the 1% of tokens with the lowest cosine or highest MSE at each site. Each value is the mean over the 18 sites and three languages.
 
 vLLM in float32 is closer but not identical to PyTorch in float32, because its kernels still sum in a different order. `benchmarks/validate.py` and `benchmarks/scaling.py` reproduce these measurements.
 

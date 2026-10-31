@@ -51,7 +51,7 @@ Options select what is compared:
 | `--max-num-batched-tokens N`, `--concurrent-waves`, `--sequences-per-call N` | vLLM chunked prefill and concurrent waves |
 | `--write-reference` | Make a vLLM run the reference, e.g. whole-prompt prefill against chunked prefill |
 
-Each comparison reports, per site, mean, minimum and first-percentile cosine similarity, relative L2 error and maximum absolute error. `all` runs the standard three-language PyTorch-against-vLLM comparison, and `plan` / `aggregate` split long runs into cluster-sized ranges.
+Each comparison reports, per site, mean, minimum and first-percentile cosine similarity, the mean cosine of the worst 1% of tokens, relative L2 error, normalised MSE (squared relative L2) with its worst-1% mean, and maximum absolute error. The worst-1% values exist only for runs that were not merged from ranges with `aggregate`. `all` runs the standard three-language PyTorch-against-vLLM comparison, and `plan` / `aggregate` split long runs into cluster-sized ranges.
 
 ## Measuring speed
 
