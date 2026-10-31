@@ -120,9 +120,11 @@ class AggregateHookExtension:
 
     def ag_reset(self):
         """Forget all counted tokens and registered requests, e.g. after a warm-up pass."""
-        if self.ag_sums is not None:
-            self.ag_sums.zero_()
-        self.ag_counts.zero_()
+        # The accumulator was created inside a forward pass, so it is an inference tensor.
+        with torch.inference_mode():
+            if self.ag_sums is not None:
+                self.ag_sums.zero_()
+            self.ag_counts.zero_()
         self.ag_requests.clear()
         return True
 

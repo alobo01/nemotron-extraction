@@ -109,10 +109,12 @@ def test_duplicate_request_id_is_rejected(worker):
 
 def test_reset_discards_a_warmup_pass(worker):
     worker.ag_begin({"w": (0, 2)})
-    schedule(worker, [("w", [5, 6], 0, 2)])
+    with torch.inference_mode():  # vLLM runs forwards in inference mode; resets arrive outside it
+        schedule(worker, [("w", [5, 6], 0, 2)])
     worker.ag_reset()
     worker.ag_begin({"a": (1, 1)})
-    schedule(worker, [("a", [7], 0, 1)])
+    with torch.inference_mode():
+        schedule(worker, [("a", [7], 0, 1)])
     sums, counts = decode_result(worker.ag_result())
     assert counts.tolist() == [0, 1]
     assert sums[0, 0].tolist() == [0.0] * 3
