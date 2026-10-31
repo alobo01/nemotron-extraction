@@ -118,6 +118,14 @@ class AggregateHookExtension:
         sums = self.ag_sums.cpu()
         return sums.numpy().tobytes(), list(sums.shape), self.ag_counts.tolist()
 
+    def ag_reset(self):
+        """Forget all counted tokens and registered requests, e.g. after a warm-up pass."""
+        if self.ag_sums is not None:
+            self.ag_sums.zero_()
+        self.ag_counts.zero_()
+        self.ag_requests.clear()
+        return True
+
     def ag_remove(self):
         for handle in self.ag_handles:
             handle.remove()
@@ -165,7 +173,7 @@ class AggregateExtractor:
             **(engine_options or {}),
         )
         self.llm, self.installed = None, False
-        self.engine_startup_seconds = self.hook_install_seconds = self.extract_seconds = 0.0
+        self.engine_startup_seconds = self.hook_install_seconds = self.warmup_seconds = self.extract_seconds = 0.0
 
     async def __aenter__(self):
         from vllm import AsyncEngineArgs, SamplingParams
@@ -201,10 +209,27 @@ class AggregateExtractor:
                 self.llm.shutdown()
                 self.llm = None
 
+    async def warmup(self, requests):
+        """Run prompts through the engine, then discard what they contributed; time goes to `warmup_seconds`.
+
+        The first forwards compile and autotune kernels, which would otherwise count as extraction time.
+        """
+        started = time.perf_counter()
+        await self._run(requests)
+        await self.llm.collective_rpc("ag_reset")
+        self.warmup_seconds += time.perf_counter() - started
+
     async def extract(self, requests, concurrency=None):
         """Sum the prompts, given as (request ID, group, token IDs); return sums [layers, groups, width], counts."""
-        requests = list(requests)
         started = time.perf_counter()
+        await self._run(requests, concurrency)
+        # Tensor-parallel ranks hold identical activations, so rank 0 speaks for all.
+        sums, counts = decode_result((await self.llm.collective_rpc("ag_result"))[0])
+        self.extract_seconds += time.perf_counter() - started
+        return sums, counts
+
+    async def _run(self, requests, concurrency=None):
+        requests = list(requests)
         table = {rid: (group, len(tokens)) for rid, group, tokens in requests}
         if len(table) != len(requests):
             raise ValueError("Request IDs must be unique")
@@ -224,7 +249,3 @@ class AggregateExtractor:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
-        # Tensor-parallel ranks hold identical activations, so rank 0 speaks for all.
-        sums, counts = decode_result((await self.llm.collective_rpc("ag_result"))[0])
-        self.extract_seconds += time.perf_counter() - started
-        return sums, counts

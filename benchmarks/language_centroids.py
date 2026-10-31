@@ -59,6 +59,9 @@ async def run(args):
         gpu_memory_utilization=args.gpu_memory_utilization,
         engine_options=json.loads(args.engine_options),
     ) as extractor:
+        if args.warmup:
+            # Distinct IDs: the worker forgets the warm-up requests, but the engine may still hold their names.
+            await extractor.warmup([(f"w{rid}", group, ids) for rid, group, ids in requests[: args.warmup]])
         sums, counts = await extractor.extract(requests)
     tokens = int(counts.sum())
     tensors = {}
@@ -90,6 +93,7 @@ async def run(args):
             "language_token_counts": {language: int(counts[i]) for i, language in enumerate(languages)},
             "engine_startup_seconds": extractor.engine_startup_seconds,
             "hook_install_seconds": extractor.hook_install_seconds,
+            "warmup_seconds": extractor.warmup_seconds,
             "tokenize_seconds": tokenize_seconds,
             "extraction_seconds": seconds,
             "requests_per_second": len(requests) / seconds,
@@ -120,6 +124,7 @@ def main():
     parser.add_argument("--max-num-seqs", type=int, default=512)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--engine-options", default="{}", help="JSON of further vLLM engine arguments")
+    parser.add_argument("--warmup", type=int, default=512, help="Rows run first and discarded; 0 to skip")
     parser.add_argument("--limit", type=int, help="Use only the first N manifest rows")
     args = parser.parse_args()
     if (args.output / "centroids.safetensors").exists():
